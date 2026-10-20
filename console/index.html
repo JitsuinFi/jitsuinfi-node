@@ -30,6 +30,15 @@
       <p class="auth-sub">Signed in. The session ends after 8 hours, or when the node restarts.</p>
     </div>
 
+    <section class="mail" id="mail" aria-labelledby="mail-title" hidden>
+      <div class="mail-head">
+        <h2 class="mail-title" id="mail-title">Mailbox</h2>
+        <button class="auth-link" id="mail-refresh" type="button">Refresh</button>
+      </div>
+      <ul class="mail-list" id="mail-list"></ul>
+      <p class="mail-note" id="mail-note" role="status" aria-live="polite"></p>
+    </section>
+
     <dl class="auth-facts">
       <dt>Network</dt><dd id="network">…</dd>
       <dt>Node key</dt><dd class="is-mono" id="fingerprint">…</dd>
