@@ -1,0 +1,4 @@
+# The jitsuin crates come from the private jitsuinfi-zcash repo: fetch with the git CLI so its
+# credentials (keychain locally, a deploy key in CI) are used.
+[net]
+git-fetch-with-cli = true
