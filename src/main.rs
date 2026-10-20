@@ -5,6 +5,7 @@
 //! Runs behind Railway's HTTPS edge, which forwards plain HTTP to PORT inside the container.
 
 mod config;
+mod console;
 mod keys;
 mod message;
 mod relay;
@@ -12,8 +13,10 @@ mod setup;
 
 use std::sync::Arc;
 
-use axum::http::{header, HeaderValue};
-use axum::routing::get;
+use axum::extract::{Path, State as AxState};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -45,9 +48,129 @@ fn public(cfg: &config::Config, node: &setup::Node) -> Public {
     }
 }
 
-fn app(p: Arc<Public>) -> Router {
+/// The console's static files, built into the binary (no file serving from disk).
+fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    Some(match path {
+        "pair" => (
+            "text/html; charset=utf-8",
+            include_bytes!("../console/pair.html"),
+        ),
+        "pair.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../console/pair.js"),
+        ),
+        "console.css" => (
+            "text/css; charset=utf-8",
+            include_bytes!("../console/console.css"),
+        ),
+        "fonts/geist.woff2" => ("font/woff2", include_bytes!("../console/fonts/geist.woff2")),
+        "fonts/geist-mono.woff2" => (
+            "font/woff2",
+            include_bytes!("../console/fonts/geist-mono.woff2"),
+        ),
+        _ => return None,
+    })
+}
+
+fn error(status: StatusCode, msg: &str) -> Response {
+    (status, Json(json!({ "error": msg }))).into_response()
+}
+
+#[derive(Clone)]
+struct State {
+    public: Arc<Public>,
+    console: Option<Arc<console::Console>>,
+    origin: Option<String>,
+}
+
+impl State {
+    /// The console, for a request from the console's own origin only (no cross-site POST).
+    fn console(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<&console::Console, (StatusCode, &'static str)> {
+        let (Some(c), Some(origin)) = (&self.console, &self.origin) else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the console is off: set NODE_ORIGIN",
+            ));
+        };
+        if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(origin.as_str()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "requests must come from the console page",
+            ));
+        }
+        Ok(c)
+    }
+}
+
+fn pair_status(e: &console::PairError) -> StatusCode {
+    use console::PairError::*;
+    match e {
+        NoCode | Expired | Ceremony => StatusCode::GONE,
+        Wrong | Rejected => StatusCode::FORBIDDEN,
+        Full => StatusCode::CONFLICT,
+        Store => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn pair_start(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let c = match st.console(&headers) {
+        Ok(c) => c,
+        Err((status, msg)) => return error(status, msg),
+    };
+    let Some(code) = body["code"].as_str().filter(|c| c.len() <= 64) else {
+        return error(StatusCode::BAD_REQUEST, "code is missing");
+    };
+    match c.start(code) {
+        Ok((ceremony, options)) => {
+            Json(json!({ "ceremony": ceremony, "options": options })).into_response()
+        }
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
+async fn pair_finish(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let c = match st.console(&headers) {
+        Ok(c) => c,
+        Err((status, msg)) => return error(status, msg),
+    };
+    let (Some(ceremony), Ok(credential)) = (
+        body["ceremony"].as_str(),
+        serde_json::from_value(body["credential"].clone()),
+    ) else {
+        return error(StatusCode::BAD_REQUEST, "ceremony or credential is missing");
+    };
+    match c.finish(ceremony, &credential) {
+        Ok(n) => {
+            println!("console: passkey paired ({n} kept)");
+            Json(json!({ "ok": true, "credentials": n })).into_response()
+        }
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
+async fn console_file(Path(path): Path<String>) -> Response {
+    match asset(&path) {
+        Some((mime, bytes)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
+        None => error(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+fn app(st: State) -> Router {
     let info = {
-        let p = p.clone();
+        let p = st.public.clone();
         move || async move {
             Json(json!({
                 "network": p.network,
@@ -65,6 +188,10 @@ fn app(p: Arc<Public>) -> Router {
             get(|| async { Json::<Value>(json!({ "ok": true })) }),
         )
         .route("/node/info", get(info))
+        .route("/node/console/pair/start", post(pair_start))
+        .route("/node/console/pair/finish", post(pair_finish))
+        .route("/console/{*path}", get(console_file))
+        .with_state(st)
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
@@ -76,6 +203,14 @@ fn app(p: Arc<Public>) -> Router {
         .layer(SetResponseHeaderLayer::overriding(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CSP),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
         ))
 }
 
@@ -135,6 +270,16 @@ async fn main() {
     );
     match cmd.as_str() {
         "setup" | "info" => {}
+        "pair" => {
+            let code = console::new_code(&cfg.data_dir).unwrap_or_else(|e| fail(e));
+            println!(
+                "pairing code {code}\nvalid for {} minutes, once; type it on {}/console/pair",
+                console::CODE_TTL.as_secs() / 60,
+                cfg.node_origin
+                    .as_deref()
+                    .unwrap_or("the node's console (set NODE_ORIGIN)")
+            );
+        }
         "inbox" => {
             let relay = relay::Relay::new(&cfg.relay_url).unwrap_or_else(|e| fail(e));
             let me = node.keys.mailbox();
@@ -161,7 +306,21 @@ async fn main() {
                 .await
                 .expect("bind PORT");
             println!("node listening on :{}", cfg.port);
-            axum::serve(listener, app(Arc::new(p)))
+            let console = cfg.node_origin.as_deref().and_then(|o| {
+                console::Console::new(o, &cfg.data_dir, node.keys.console_user())
+                    .map_err(|e| eprintln!("console off: {e}"))
+                    .ok()
+                    .map(Arc::new)
+            });
+            if console.is_none() && cfg.node_origin.is_none() {
+                println!("console off: NODE_ORIGIN is not set");
+            }
+            let st = State {
+                public: Arc::new(p),
+                console,
+                origin: cfg.node_origin.clone(),
+            };
+            axum::serve(listener, app(st))
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })
@@ -169,7 +328,7 @@ async fn main() {
                 .expect("serve");
         }
         other => {
-            eprintln!("unknown command {other}: use setup, info, inbox or serve");
+            eprintln!("unknown command {other}: use setup, info, pair, inbox or serve");
             std::process::exit(2);
         }
     }

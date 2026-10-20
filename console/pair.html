@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Pair console · JitsuinFi node</title>
+<link rel="stylesheet" href="console.css">
+<script src="pair.js" defer></script>
+</head>
+<body>
+<main class="auth">
+  <section class="auth-sheet" aria-labelledby="title">
+    <header class="auth-head">
+      <svg class="auth-logo" viewBox="0 0 100 100" aria-hidden="true"><circle class="ring" cx="50" cy="50" r="44"/><circle class="ring-fine" cx="50" cy="50" r="36"/><text class="kanji" x="50" y="67" text-anchor="middle">印</text></svg>
+      <p class="auth-eyebrow">Financier node</p>
+      <h1 class="auth-title" id="title">Pair a passkey with this console</h1>
+      <p class="auth-sub">The console opens only with a passkey paired here. A pairing code comes from the node itself, so only someone who runs the node can pair.</p>
+    </header>
+
+    <form class="auth-form" id="pair" novalidate>
+      <label class="auth-field">
+        <span>Pairing code</span>
+        <input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" inputmode="text" maxlength="24" placeholder="XXXX-XXXX-XXXX-XXXX" required aria-describedby="code-help">
+        <small id="code-help">Run <code>jitsuin-node pair</code> on the node. A code works once, for 15 minutes.</small>
+      </label>
+      <button class="auth-button" id="go" type="submit">Create passkey</button>
+      <p class="auth-msg" id="msg" role="status" aria-live="polite"></p>
+    </form>
+
+    <div class="auth-verdict" id="done" hidden>
+      <div class="hanko" aria-hidden="true">認</div>
+      <h2 class="auth-title">Passkey paired</h2>
+      <p class="auth-sub" id="done-line"></p>
+    </div>
+
+    <dl class="auth-facts">
+      <dt>Network</dt><dd id="network">…</dd>
+      <dt>Node key</dt><dd class="is-mono" id="fingerprint">…</dd>
+    </dl>
+
+    <footer class="auth-foot">
+      <p class="auth-host">Passkeys work only on this address: <span id="host"></span></p>
+    </footer>
+  </section>
+</main>
+</body>
+</html>

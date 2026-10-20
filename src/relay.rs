@@ -251,25 +251,11 @@ pub fn contact_card(mailbox_pk: &[u8; 32], financier_pk: &[u8; 32]) -> String {
 /// financier:" ‖ financier_pk), first 10 bytes. Anyone holding `financier_pk` can recompute it.
 pub fn fingerprint(financier_pk: &[u8; 32]) -> String {
     use sha2::{Digest, Sha256};
-    const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let d = Sha256::new()
         .chain_update(b"jitsuin-fingerprint-v1:financier:")
         .chain_update(financier_pk)
         .finalize();
-    let (mut bits, mut value, mut out) = (0u32, 0u32, String::new());
-    for b in &d[..10] {
-        value = (value << 8) | u32::from(*b);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            out.push(B32[((value >> bits) & 31) as usize] as char);
-        }
-    }
-    out.as_bytes()
-        .chunks(4)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect::<Vec<_>>()
-        .join("-")
+    message::base32_groups(&d[..10])
 }
 
 #[cfg(test)]

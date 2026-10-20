@@ -24,6 +24,25 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// 10 bytes as 16 base32 characters in groups of 4 (fingerprints, pairing codes).
+pub fn base32_groups(bytes: &[u8]) -> String {
+    const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let (mut bits, mut value, mut out) = (0u32, 0u32, String::new());
+    for b in bytes {
+        value = (value << 8) | u32::from(*b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(B32[((value >> bits) & 31) as usize] as char);
+        }
+    }
+    out.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 pub fn unhex<const N: usize>(s: &str) -> Result<[u8; N], String> {
     if s.len() != 2 * N
         || !s

@@ -5,6 +5,8 @@
 //!   "financier")`. Its public key is the financier's identity in commitments, letters, receipts.
 //! - mailbox seed: `BLAKE2b-256(key = master, personalization = "JitsuinNodeMbox_", "mailbox")`,
 //!   used as the browser uses its inbox PRF output (`jitsuin_core::mailbox::MailboxKeys::from_prf`).
+//! - console user handle: `BLAKE2b-256(key = master, personalization = "JitsuinNodeCons_",
+//!   "console-user")`, first 16 bytes: the WebAuthn `user.id` of the console passkeys (public).
 //!
 //! The Zcash spending key is separate: the zcash-devtool wallet keeps its own seed, encrypted to
 //! the age identity in the same volume.
@@ -65,6 +67,13 @@ impl NodeKeys {
 
     pub fn financier(&self) -> SigningKey {
         SigningKey::from_bytes(&derive(&self.master, b"JitsuinNodeFin__", b"financier"))
+    }
+
+    pub fn console_user(&self) -> [u8; 16] {
+        let d = derive(&self.master, b"JitsuinNodeCons_", b"console-user");
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&d[..16]);
+        out
     }
 
     pub fn mailbox(&self) -> MailboxKeys {
