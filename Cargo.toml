@@ -20,5 +20,9 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tower-http = { version = "0.6", features = ["set-header"] }
 rand = "0.9"
+# Approved by the user 2026-10-20: HTTPS client to the relay (rustls, no OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
