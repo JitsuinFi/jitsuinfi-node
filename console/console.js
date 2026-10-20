@@ -27,6 +27,75 @@ function assertionJson(cred) {
 
 const short = (s) => (s.length > 20 ? `${s.slice(0, 10)}…${s.slice(-8)}` : s);
 
+// Message types (jitsuinfi-frontend src/lib/relay-message.ts) in the operator's words.
+const TYPE_LABEL = {
+  "deal.offer": "Financing offer",
+  "deal.entry": "Board entry",
+  "deal.seal": "Seal",
+  "history.chain": "Buyer history",
+  "invoice.signature": "Buyer signature",
+  "key.invoice_pk": "Invoice key",
+  "invoice.sign_request": "Signing request",
+};
+const ROLE_BADGE = { supplier: "売", buyer: "買", fund: "資", member: "資", financier: "証" };
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  for (const c of children) e.append(c);
+  return e;
+}
+
+function ago(iso) {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (s < 90) return "just now";
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} days ago`;
+}
+
+function kib(n) {
+  return n < 1024 ? `${n} B` : `${Math.round(n / 1024)} KB`;
+}
+
+function mailRow(m) {
+  const signed = m.signer !== undefined && m.signer !== null;
+  const verdict = signed ? el("span", { class: m.signature_ok ? "mail-verdict" : "mail-verdict is-bad", title: m.signature_ok ? "Signature holds" : "Signature does not hold" }, m.signature_ok ? "認" : "拒") : el("span");
+  const line = el("span", { class: "mail-line" }, `from ${m.from?.role ?? "?"} · ${ago(m.received_at)}`);
+  if (m.n) line.append(" · N ", el("span", { class: "is-mono" }, short(m.n)));
+  const actions = el("div", { class: "mail-actions" });
+  (m.attachments || []).forEach((a, i) => actions.append(el("a", { href: `/node/mail/${encodeURIComponent(m.relay_id)}/attachments/${i}`, download: "" }, `${a.name} (${kib(a.size)})`)));
+  const remove = el("button", { type: "button" }, "Remove");
+  remove.addEventListener("click", async () => {
+    remove.disabled = true;
+    try {
+      const r = await fetch(`/node/mail/${encodeURIComponent(m.relay_id)}`, { method: "DELETE", credentials: "same-origin" });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `the node answered ${r.status}`);
+      await loadMail();
+    } catch (e) {
+      $("mail-note").textContent = e.message;
+      remove.disabled = false;
+    }
+  });
+  actions.append(remove);
+  return el("li", { class: "mail-row" }, el("span", { class: "mail-badge", "aria-hidden": "true" }, ROLE_BADGE[m.from?.role] ?? "外"), el("span", { class: "mail-what" }, TYPE_LABEL[m.type] ?? m.type), verdict, line, actions);
+}
+
+async function loadMail() {
+  const note = $("mail-note");
+  note.textContent = "Opening sealed messages…";
+  try {
+    const r = await fetch("/node/mail", { credentials: "same-origin" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || `the node answered ${r.status}`);
+    $("mail-list").replaceChildren(...j.messages.map(mailRow));
+    const refused = j.refused ? ` ${j.refused} could not be opened or were addressed elsewhere.` : "";
+    note.textContent = j.messages.length ? refused.trim() : `No messages.${refused}`;
+  } catch (e) {
+    note.textContent = e.message;
+  }
+}
+
 async function render() {
   const [session, info] = await Promise.all([
     fetch("/node/console/session", { credentials: "same-origin" }).then((r) => r.json()),
@@ -37,13 +106,15 @@ async function render() {
   $("signin").hidden = session.signed_in;
   $("home").hidden = !session.signed_in;
   $("out").hidden = !session.signed_in;
-  for (const el of document.querySelectorAll("[data-private]")) el.hidden = !session.signed_in;
+  for (const e of document.querySelectorAll("[data-private]")) e.hidden = !session.signed_in;
+  $("mail").hidden = !session.signed_in;
   if (session.signed_in) {
     $("lede").textContent = "This node's keys and wallet stay on the node.";
     $("mailbox").textContent = short(info.mailbox_id);
     $("mailbox").title = info.mailbox_id;
     $("wallet").textContent = short(info.wallet_address);
     $("wallet").title = info.wallet_address;
+    loadMail();
   } else if (!session.console) {
     $("go").disabled = true;
     $("msg").textContent = "The console is off on this node (NODE_ORIGIN is not set).";
@@ -79,6 +150,7 @@ async function signIn() {
 document.addEventListener("DOMContentLoaded", () => {
   $("host").textContent = location.host;
   $("go").addEventListener("click", signIn);
+  $("mail-refresh").addEventListener("click", loadMail);
   $("out").addEventListener("click", async () => {
     await post("/node/console/logout").catch(() => {});
     await render();

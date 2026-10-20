@@ -7,6 +7,7 @@
 mod config;
 mod console;
 mod keys;
+mod mail;
 mod message;
 mod relay;
 mod setup;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State as AxState};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -93,6 +94,7 @@ struct State {
     public: Arc<Public>,
     console: Option<Arc<console::Console>>,
     origin: Option<String>,
+    mail: Arc<mail::Mail>,
 }
 
 impl State {
@@ -114,6 +116,85 @@ impl State {
             ));
         }
         Ok(c)
+    }
+}
+
+impl State {
+    /// A request with an open console session; `write` also needs the console's own `Origin`.
+    fn signed_in(
+        &self,
+        headers: &HeaderMap,
+        write: bool,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        let c = if write {
+            self.console(headers)?
+        } else {
+            self.console.as_deref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the console is off: set NODE_ORIGIN",
+            ))?
+        };
+        match session_token(headers) {
+            Some(t) if c.session(t) => Ok(()),
+            _ => Err((StatusCode::UNAUTHORIZED, "sign in to the console first")),
+        }
+    }
+}
+
+async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    match st.mail.list().await {
+        Ok((messages, refused)) => {
+            Json(json!({ "messages": messages, "refused": refused })).into_response()
+        }
+        Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    }
+}
+
+async fn mail_attachment(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path((id, index)): Path<(String, usize)>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    match st.mail.attachment(&id, index) {
+        Some((name, bytes)) => (
+            [
+                (header::CONTENT_TYPE, "application/pdf".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", mail::safe_name(&name)),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "list the mailbox again; this attachment is not in it",
+        ),
+    }
+}
+
+async fn mail_remove(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    match st.mail.remove(&id).await {
+        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(false) => error(
+            StatusCode::NOT_FOUND,
+            "list the mailbox again; this message is not in it",
+        ),
+        Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
     }
 }
 
@@ -292,6 +373,9 @@ fn app(st: State) -> Router {
         .route("/node/console/login/finish", post(login_finish))
         .route("/node/console/session", get(session))
         .route("/node/console/logout", post(logout))
+        .route("/node/mail", get(mail_list))
+        .route("/node/mail/{id}", delete(mail_remove))
+        .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
         .route("/console/", get(|| console_file(Path(String::new()))))
         .route(
             "/console",
@@ -422,10 +506,12 @@ async fn main() {
             if console.is_none() && cfg.node_origin.is_none() {
                 println!("console off: NODE_ORIGIN is not set");
             }
+            let relay = relay::Relay::new(&cfg.relay_url).unwrap_or_else(|e| fail(e));
             let st = State {
                 public: Arc::new(p),
                 console,
                 origin: cfg.node_origin.clone(),
+                mail: Arc::new(mail::Mail::new(relay, node.keys.mailbox())),
             };
             axum::serve(listener, app(st))
                 .with_graceful_shutdown(async {

@@ -154,7 +154,7 @@ impl Relay {
             .ok_or_else(|| RelayError("the relay gave no message id".into()))
     }
 
-    async fn token(&self, me: &MailboxKeys) -> Result<String> {
+    pub async fn read_token(&self, me: &MailboxKeys) -> Result<String> {
         let body = self.proven(me, Purpose::Read).await?;
         let r = self
             .json(
@@ -172,7 +172,7 @@ impl Relay {
     /// Every message in the mailbox, opened and checked; returns the read token for removals and
     /// the number of messages refused (do not open, malformed, or addressed elsewhere).
     pub async fn receive(&self, me: &MailboxKeys) -> Result<(Vec<Received>, usize, String)> {
-        let token = self.token(me).await?;
+        let token = self.read_token(me).await?;
         let id = hex(&me.id());
         let list: Vec<Listed> = serde_json::from_value(
             self.json(
@@ -218,7 +218,6 @@ impl Relay {
         Ok((out, refused, token))
     }
 
-    #[allow(dead_code)] // the deal API removes handled messages (HNK-26.T5+)
     /// Removes a message after it was used.
     pub async fn remove(&self, me: &MailboxKeys, relay_id: &str, token: &str) -> Result<()> {
         self.call(
