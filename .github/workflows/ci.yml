@@ -67,7 +67,8 @@ jobs:
         run: |
           mkdir -p deploy/bin
           cp target/release/jitsuin-node ~/.cargo/bin/zcash-devtool deploy/bin/
+      # The archive is deploy/ only (Dockerfile + binaries); deploy/bin is git-ignored, so keep it.
       - name: railway up
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: npx --yes @railway/cli@5.71.0 up deploy --service financier-node --ci --detach
+        run: npx --yes @railway/cli@5.71.0 up deploy --path-as-root --no-gitignore --service financier-node --ci --detach
