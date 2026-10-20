@@ -1,28 +1,7 @@
 // Console pairing page (HNK-26.T2, BL-D21-16). The node checks the one-time code, the browser
 // creates a passkey for this origin, and the node verifies the attestation and keeps the
-// credential. Plain script, same origin only (CSP script-src 'self').
+// credential. Plain script, same origin only (CSP script-src 'self'); helpers in passkey.js.
 "use strict";
-
-const $ = (id) => document.getElementById(id);
-
-const b64u = {
-  decode(s) {
-    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
-    return Uint8Array.from(bin, (c) => c.charCodeAt(0)).buffer;
-  },
-  encode(buf) {
-    let s = "";
-    for (const b of new Uint8Array(buf)) s += String.fromCharCode(b);
-    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  },
-};
-
-async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), credentials: "same-origin" });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || `the node answered ${r.status}`);
-  return j;
-}
 
 function creationOptions(publicKey) {
   return {
@@ -95,8 +74,7 @@ async function info() {
     const r = await fetch("/node/info", { credentials: "same-origin" });
     const j = await r.json();
     $("network").textContent = j.network === "main" ? "Zcash mainnet" : "Zcash testnet";
-    const card = JSON.parse(atob(j.contact.slice("jitsuin-contact-v1:".length).replace(/-/g, "+").replace(/_/g, "/")));
-    $("fingerprint").textContent = card.fingerprint;
+    $("fingerprint").textContent = contactFingerprint(j.contact);
   } catch {
     $("network").textContent = "unknown";
     $("fingerprint").textContent = "unknown";

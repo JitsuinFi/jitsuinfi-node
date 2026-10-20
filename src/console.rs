@@ -7,6 +7,12 @@
 //!
 //! A code is used up on the first correct try, refused after it expires, and dropped after five
 //! wrong tries. Nothing secret is logged.
+//!
+//! Sessions (HNK-26.T3, BL-D21-17, flows F1.39 – F1.43): a one-time challenge (2 minutes) for
+//! the paired credentials, an assertion checked for origin, `rpIdHash`, user verification,
+//! signature and counter, then a random session token in a `__Host-` cookie (`Secure`,
+//! `HttpOnly`, `SameSite=Strict`, 8 hours). The node keeps only the token's SHA-256, in memory:
+//! a restart signs everyone out.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,8 +25,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, Passkey, PasskeyRegistration, RegisterPublicKeyCredential, Url,
-    Uuid, Webauthn, WebauthnBuilder,
+    CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
+    Webauthn, WebauthnBuilder,
 };
 
 use crate::message::{base32_groups, hex};
@@ -29,6 +36,9 @@ pub const CODE_TTL: Duration = Duration::from_secs(15 * 60);
 const CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_TRIES: u32 = 5;
 const MAX_CREDENTIALS: usize = 10;
+const LOGIN_TTL: Duration = Duration::from_secs(2 * 60);
+pub const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+pub const COOKIE: &str = "__Host-jitsuin_console";
 
 fn now() -> u64 {
     SystemTime::now()
@@ -87,6 +97,8 @@ pub enum PairError {
     Ceremony,
     Rejected,
     Store,
+    NotPaired,
+    LoginGone,
 }
 
 impl PairError {
@@ -99,6 +111,8 @@ impl PairError {
             PairError::Ceremony => "this pairing has expired or was already finished; start again",
             PairError::Rejected => "the passkey response did not verify",
             PairError::Store => "the node could not save the passkey",
+            PairError::NotPaired => "no passkey is paired with this console yet; pair one first",
+            PairError::LoginGone => "this sign-in has expired or was already used; try again",
         }
     }
 }
@@ -109,7 +123,20 @@ pub struct Console {
     pairing: PathBuf,
     credentials: PathBuf,
     ceremonies: Mutex<HashMap<String, (PasskeyRegistration, Instant)>>,
+    logins: Mutex<HashMap<String, (PasskeyAuthentication, Instant)>>,
+    /// SHA-256 of each session token, and when the session ends.
+    sessions: Mutex<HashMap<String, Instant>>,
     lock: Mutex<()>,
+}
+
+fn token_hash(token: &str) -> String {
+    hex(&Sha256::digest(token.as_bytes()))
+}
+
+fn random_hex<const N: usize>() -> String {
+    let mut b = [0u8; N];
+    rand::rng().fill_bytes(&mut b);
+    hex(&b)
 }
 
 /// Makes a pairing code and stores its hash; returns the code to show the operator once.
@@ -147,6 +174,8 @@ impl Console {
             pairing: data_dir.join("pairing.json"),
             credentials: data_dir.join("console-credentials.json"),
             ceremonies: Mutex::new(HashMap::new()),
+            logins: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
             lock: Mutex::new(()),
         })
     }
@@ -239,6 +268,81 @@ impl Console {
         .map_err(|_| PairError::Store)?;
         Ok(stored.len())
     }
+
+    /// A one-time challenge for every paired credential.
+    pub fn login_start(&self) -> Result<(String, RequestChallengeResponse), PairError> {
+        let passkeys: Vec<Passkey> = self.stored().into_iter().map(|s| s.passkey).collect();
+        if passkeys.is_empty() {
+            return Err(PairError::NotPaired);
+        }
+        let (options, state) = self
+            .webauthn
+            .start_passkey_authentication(&passkeys)
+            .map_err(|_| PairError::Rejected)?;
+        let id = random_hex::<16>();
+        let mut l = self.logins.lock().unwrap();
+        l.retain(|_, (_, at)| at.elapsed() < LOGIN_TTL);
+        l.insert(id.clone(), (state, Instant::now()));
+        Ok((id, options))
+    }
+
+    /// Checks the assertion against its challenge (used once, whatever the outcome) and opens a
+    /// session; returns the session token for the cookie.
+    pub fn login_finish(
+        &self,
+        ceremony: &str,
+        credential: &PublicKeyCredential,
+    ) -> Result<String, PairError> {
+        let (state, at) = self
+            .logins
+            .lock()
+            .unwrap()
+            .remove(ceremony)
+            .ok_or(PairError::LoginGone)?;
+        if at.elapsed() >= LOGIN_TTL {
+            return Err(PairError::LoginGone);
+        }
+        let result = self
+            .webauthn
+            .finish_passkey_authentication(credential, &state)
+            .map_err(|_| PairError::Rejected)?;
+        if !result.user_verified() {
+            return Err(PairError::Rejected);
+        }
+        {
+            let _g = self.lock.lock().unwrap();
+            let mut stored = self.stored();
+            let mut changed = false;
+            for s in &mut stored {
+                changed |= s.passkey.update_credential(&result) == Some(true);
+            }
+            if changed {
+                write_private(
+                    &self.credentials,
+                    &serde_json::to_vec(&stored).expect("json"),
+                )
+                .map_err(|_| PairError::Store)?;
+            }
+        }
+        let token = random_hex::<32>();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, end| *end > Instant::now());
+        sessions.insert(token_hash(&token), Instant::now() + SESSION_TTL);
+        Ok(token)
+    }
+
+    /// True while `token` names an open session.
+    pub fn session(&self, token: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&token_hash(token))
+            .is_some_and(|end| *end > Instant::now())
+    }
+
+    pub fn logout(&self, token: &str) {
+        self.sessions.lock().unwrap().remove(&token_hash(token));
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +395,24 @@ mod tests {
         p.expires_at = now() - 1;
         fs::write(d.join("pairing.json"), serde_json::to_vec(&p).unwrap()).unwrap();
         assert_eq!(c.start("ANY").unwrap_err(), PairError::Expired);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn sign_in_needs_a_paired_passkey_and_a_live_challenge() {
+        let d = dir("login");
+        let c = Console::new("http://localhost:8788", &d, [1; 16]).unwrap();
+        assert_eq!(c.login_start().unwrap_err(), PairError::NotPaired);
+        let cred: PublicKeyCredential = serde_json::from_value(serde_json::json!({
+            "id": "AA", "rawId": "AA", "type": "public-key",
+            "response": { "authenticatorData": "AA", "clientDataJSON": "AA", "signature": "AA" }
+        }))
+        .unwrap();
+        assert_eq!(
+            c.login_finish("nope", &cred).unwrap_err(),
+            PairError::LoginGone
+        );
+        assert!(!c.session("not-a-token"));
         fs::remove_dir_all(&d).unwrap();
     }
 

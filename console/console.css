@@ -69,6 +69,8 @@ body {
 .auth-sub { margin: 0; font-size: 14px; line-height: 1.5; color: var(--ink-2); max-width: 32ch; }
 
 .auth-form { display: flex; flex-direction: column; gap: 14px; }
+#signin { align-items: stretch; }
+#signin .auth-link { align-self: center; }
 .auth-field { display: flex; flex-direction: column; gap: 6px; }
 .auth-field > span { font-size: 13px; font-weight: 600; color: var(--head); }
 .auth-field input {
@@ -105,6 +107,7 @@ body {
   gap: 10px;
   transition: background var(--dur-fade) ease, transform var(--dur-press) linear;
 }
+a.auth-button { text-decoration: none; }
 .auth-button:hover { background: var(--seal-hi); }
 .auth-button:active { transform: scale(.985); }
 .auth-button:disabled { cursor: default; opacity: .5; }
@@ -154,6 +157,17 @@ body {
 @keyframes hanko-press { from { opacity: 0; transform: rotate(-8deg) scale(1.35); } }
 
 .auth-foot { display: flex; flex-direction: column; align-items: center; gap: 6px; padding-top: 2px; }
+.auth-link {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: 600 14px/1 var(--f-body);
+  color: var(--seal);
+  padding: 10px 12px;
+  cursor: pointer;
+  text-align: center;
+  text-decoration: none;
+}
 .auth-host { margin: 0; font-size: 12px; line-height: 1.5; color: var(--ink-2); text-align: center; opacity: .85; }
 
 @media (max-width: 480px) {
