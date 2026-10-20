@@ -1,11 +1,13 @@
 //! jitsuin-node: a financier's node (HNK-26). This first part sets the node up on testnet
-//! (HNK-26.T1) and serves its public identity; the deal API, the relay mailbox and the console
-//! follow.
+//! (HNK-26.T1), serves its public identity, and registers the financier mailbox at the relay
+//! (HNK-26.T4); the deal API and the console follow.
 //!
 //! Runs behind Railway's HTTPS edge, which forwards plain HTTP to PORT inside the container.
 
 mod config;
 mod keys;
+mod message;
+mod relay;
 mod setup;
 
 use std::sync::Arc;
@@ -27,13 +29,16 @@ struct Public {
     mailbox_pk: String,
     mailbox_id: String,
     wallet_address: String,
+    contact: String,
 }
 
 fn public(cfg: &config::Config, node: &setup::Node) -> Public {
     let mb = node.keys.mailbox();
+    let fin = node.keys.financier().verifying_key().to_bytes();
     Public {
         network: cfg.network.clone(),
-        financier_pk: hex(&node.keys.financier().verifying_key().to_bytes()),
+        financier_pk: hex(&fin),
+        contact: relay::contact_card(&mb.public(), &fin),
         mailbox_pk: hex(&mb.public()),
         mailbox_id: hex(&mb.id()),
         wallet_address: node.wallet_address.clone(),
@@ -50,6 +55,7 @@ fn app(p: Arc<Public>) -> Router {
                 "mailbox_pk": p.mailbox_pk,
                 "mailbox_id": p.mailbox_id,
                 "wallet_address": p.wallet_address,
+                "contact": p.contact,
             }))
         }
     };
@@ -71,6 +77,29 @@ fn app(p: Arc<Public>) -> Router {
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
         ))
+}
+
+fn fail(e: impl std::fmt::Display) -> ! {
+    eprintln!("{e}");
+    std::process::exit(1)
+}
+
+/// Registers the mailbox at the relay, retrying with backoff: the node serves its identity even
+/// while the relay is down, and the deal API refuses work until this succeeds (next task).
+async fn register_mailbox(relay_url: String, me: jitsuin_core::mailbox::MailboxKeys) {
+    let relay = match relay::Relay::new(&relay_url) {
+        Ok(r) => r,
+        Err(e) => return eprintln!("relay: {e}"),
+    };
+    let mut wait = 5;
+    loop {
+        match relay.ensure_mailbox(&me).await {
+            Ok(()) => return println!("relay: mailbox registered at {relay_url}"),
+            Err(e) => eprintln!("relay: {e}; retrying in {wait} s"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        wait = (wait * 2).min(600);
+    }
 }
 
 #[tokio::main]
@@ -106,7 +135,28 @@ async fn main() {
     );
     match cmd.as_str() {
         "setup" | "info" => {}
+        "inbox" => {
+            let relay = relay::Relay::new(&cfg.relay_url).unwrap_or_else(|e| fail(e));
+            let me = node.keys.mailbox();
+            relay.ensure_mailbox(&me).await.unwrap_or_else(|e| fail(e));
+            let (got, refused, _) = relay.receive(&me).await.unwrap_or_else(|e| fail(e));
+            for r in &got {
+                let h = &r.message.header;
+                println!(
+                    "{} {} from {} n={} signature={} attachments={} at {}",
+                    r.relay_id,
+                    h["type"].as_str().unwrap_or("?"),
+                    h["from"]["role"].as_str().unwrap_or("?"),
+                    h["n"].as_str().unwrap_or("-"),
+                    if r.signature_ok { "ok" } else { "BAD" },
+                    r.message.attachments.len(),
+                    r.received_at
+                );
+            }
+            println!("{} message(s), {refused} refused", got.len());
+        }
         "serve" => {
+            tokio::spawn(register_mailbox(cfg.relay_url.clone(), node.keys.mailbox()));
             let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port))
                 .await
                 .expect("bind PORT");
@@ -119,7 +169,7 @@ async fn main() {
                 .expect("serve");
         }
         other => {
-            eprintln!("unknown command {other}: use setup, info or serve");
+            eprintln!("unknown command {other}: use setup, info, inbox or serve");
             std::process::exit(2);
         }
     }
