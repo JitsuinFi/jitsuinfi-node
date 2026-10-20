@@ -1,0 +1,24 @@
+[package]
+name = "jitsuin-node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+description = "JitsuinFi financier node: wallet, deal state, relay mailbox and console (HNK-26)"
+
+[dependencies]
+# Pinned to a reviewed commit of jitsuinfi-zcash (main after PR #15).
+jitsuin-core = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "5c4e70211909007f1812caf52b3a5ed6a1c85717" }
+jitsuin-flow = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "5c4e70211909007f1812caf52b3a5ed6a1c85717" }
+jitsuin-board = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "5c4e70211909007f1812caf52b3a5ed6a1c85717" }
+jitsuin-wallet = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "5c4e70211909007f1812caf52b3a5ed6a1c85717" }
+# Same pins as the jitsuinfi-zcash workspace (D-10).
+blake2b_simd = "=1.0.5"
+ed25519-dalek = "2.2"
+# Approved by the user 2026-10-20: HTTP server and console (behind Railway's HTTPS edge).
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower-http = { version = "0.6", features = ["set-header"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
