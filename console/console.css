@@ -1,0 +1,168 @@
+/* Node console (HNK-26). The same sign-in sheet as the web app's account screen
+   (jitsuinfi-frontend src/auth.css), in the DS-PAL palette (vault 09-Design): a paper sheet,
+   the 印 seal, inset rows, one Dark Raspberry action. Served from the node's own origin. */
+@font-face { font-family: "Geist Variable"; src: url("fonts/geist.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "Geist Mono Variable"; src: url("fonts/geist-mono.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+
+:root {
+  --paper: #F6F5FC;
+  --sheet: #FCFCFE;
+  --fiber: #ECD0EC;
+  --fold: #BA71A2;
+  --head: #020D2F;
+  --ink: #461D3A;
+  --ink-2: #502A50;
+  --seal: #7E2A53;
+  --seal-hi: #6B2347;
+  --glint: #1D97F1;
+  --rule: rgba(70, 29, 58, .14);
+  --seal-wash: rgba(126, 42, 83, .08);
+  --f-display: "Shippori Mincho B1", "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", Georgia, serif;
+  --f-body: "Geist Variable", "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "Geist Mono Variable", "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --dur-press: 67ms;
+  --dur-fade: 200ms;
+  --dur-seal: 367ms;
+  --ease-land: cubic-bezier(.22, .78, .51, .94);
+  --ease-snap: cubic-bezier(.13, 1.06, .31, .94);
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 15px/1.5 var(--f-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+.auth {
+  min-height: 100dvh;
+  display: grid;
+  place-items: start center;
+  padding: clamp(24px, 10vh, 96px) max(16px, env(safe-area-inset-right, 0px)) calc(48px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+}
+
+.auth-sheet {
+  width: 100%;
+  max-width: 400px;
+  background: var(--sheet);
+  border-radius: 24px;
+  box-shadow: 0 1px 2px rgba(70, 29, 58, .06), 0 18px 48px rgba(70, 29, 58, .12);
+  padding: 28px 24px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  animation: auth-in 280ms var(--ease-land) both;
+}
+@keyframes auth-in { from { opacity: 0; transform: translateY(8px) scale(.985); } }
+
+.auth-head { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; }
+.auth-logo { width: 48px; height: 48px; margin-bottom: 6px; }
+.auth-logo .ring { fill: none; stroke: var(--seal); stroke-width: 7; }
+.auth-logo .ring-fine { fill: none; stroke: var(--seal); stroke-width: 2.2; }
+.auth-logo .kanji { fill: var(--seal); font: 800 46px var(--f-display); }
+.auth-eyebrow { margin: 0; font: 600 11px/1 var(--f-body); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
+.auth-title { margin: 0; font: 600 20px/1.25 var(--f-body); color: var(--head); letter-spacing: -.01em; text-wrap: balance; }
+.auth-sub { margin: 0; font-size: 14px; line-height: 1.5; color: var(--ink-2); max-width: 32ch; }
+
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.auth-field { display: flex; flex-direction: column; gap: 6px; }
+.auth-field > span { font-size: 13px; font-weight: 600; color: var(--head); }
+.auth-field input {
+  font: 500 18px/1.3 var(--f-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  text-align: center;
+  color: var(--head);
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: 13px 14px;
+  transition: border-color var(--dur-fade) ease;
+}
+.auth-field input::placeholder { color: rgba(80, 42, 80, .38); }
+.auth-field input:focus { border-color: var(--seal); outline: none; box-shadow: 0 0 0 3px rgba(126, 42, 83, .12); }
+.auth-field input[aria-invalid="true"] { border-color: var(--seal); }
+.auth-field small { font-size: 12px; line-height: 1.45; color: var(--ink-2); }
+.auth-field code { font: 500 12px var(--f-mono); color: var(--head); background: rgba(70, 29, 58, .06); padding: 1px 5px; border-radius: 6px; }
+
+.auth-button {
+  appearance: none;
+  border: 0;
+  min-height: 50px;
+  width: 100%;
+  border-radius: 12px;
+  background: var(--seal);
+  color: var(--sheet);
+  font: 600 16px/1 var(--f-body);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: background var(--dur-fade) ease, transform var(--dur-press) linear;
+}
+.auth-button:hover { background: var(--seal-hi); }
+.auth-button:active { transform: scale(.985); }
+.auth-button:disabled { cursor: default; opacity: .5; }
+.auth-button.is-waiting { opacity: 1; }
+.auth-button.is-waiting::after {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid rgba(252, 252, 254, .35);
+  border-top-color: var(--sheet);
+  animation: auth-spin 700ms linear infinite;
+}
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+.auth :is(button, a, input):focus-visible { outline: 2px solid var(--glint); outline-offset: 2px; }
+
+.auth-msg { margin: -4px 0 0; font-size: 13px; line-height: 1.5; color: var(--seal); text-align: center; }
+.auth-msg:empty { display: none; }
+
+.auth-facts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 16px;
+  padding: 14px 2px 0;
+  border-top: 1px solid var(--rule);
+  font-size: 13px;
+}
+.auth-facts dt { color: var(--ink-2); }
+.auth-facts dd { margin: 0; text-align: right; color: var(--head); min-width: 0; overflow-wrap: anywhere; }
+.auth-facts dd.is-mono { font-family: var(--f-mono); letter-spacing: .03em; }
+
+/* the verdict: the seal is pressed once, like a hanko on paper */
+.auth-verdict { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+.hanko {
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  border: 3px solid var(--seal);
+  display: grid;
+  place-items: center;
+  color: var(--seal);
+  font: 800 38px/1 var(--f-display);
+  transform: rotate(-8deg);
+  animation: hanko-press var(--dur-seal) var(--ease-snap) both;
+}
+@keyframes hanko-press { from { opacity: 0; transform: rotate(-8deg) scale(1.35); } }
+
+.auth-foot { display: flex; flex-direction: column; align-items: center; gap: 6px; padding-top: 2px; }
+.auth-host { margin: 0; font-size: 12px; line-height: 1.5; color: var(--ink-2); text-align: center; opacity: .85; }
+
+@media (max-width: 480px) {
+  .auth { justify-items: stretch; padding-top: 16px; }
+  .auth-sheet { max-width: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-sheet, .hanko { animation: none; }
+  .auth-button.is-waiting::after { animation-duration: 2s; }
+  .auth * { transition: none !important; }
+}

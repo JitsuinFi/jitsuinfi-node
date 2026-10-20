@@ -18,6 +18,9 @@ pub struct Config {
     pub board_birthday: u32,
     /// The relay (jitsuinfi-backend), for the financier's mailbox.
     pub relay_url: String,
+    /// The console's own origin (Railway domain), whose host is the passkey `rp.id`; without it
+    /// the console pairing is off.
+    pub node_origin: Option<String>,
     /// A name for the wallet account (test data starts with TES-).
     pub wallet_name: String,
 }
@@ -70,6 +73,7 @@ impl Config {
                 .map_err(|_| "BOARD_BIRTHDAY must be a block height")?,
             relay_url: var("RELAY_URL")
                 .unwrap_or_else(|| "https://relay-production-27dc.up.railway.app".into()),
+            node_origin: var("NODE_ORIGIN").map(|o| o.trim_end_matches('/').to_string()),
             wallet_name: var("WALLET_NAME").unwrap_or_else(|| "TES-financier-node".into()),
         })
     }
