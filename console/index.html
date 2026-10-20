@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Financier console · JitsuinFi node</title>
+<link rel="stylesheet" href="console.css">
+<script src="passkey.js" defer></script>
+<script src="console.js" defer></script>
+</head>
+<body>
+<main class="auth">
+  <section class="auth-sheet" aria-labelledby="title">
+    <header class="auth-head">
+      <svg class="auth-logo" viewBox="0 0 100 100" aria-hidden="true"><circle class="ring" cx="50" cy="50" r="44"/><circle class="ring-fine" cx="50" cy="50" r="36"/><text class="kanji" x="50" y="67" text-anchor="middle">印</text></svg>
+      <p class="auth-eyebrow">Financier node</p>
+      <h1 class="auth-title" id="title">Financier console</h1>
+      <p class="auth-sub" id="lede">Sign in with the passkey paired to this node.</p>
+    </header>
+
+    <div class="auth-form" id="signin" hidden>
+      <button class="auth-button" id="go" type="button">Sign in with passkey</button>
+      <p class="auth-msg" id="msg" role="status" aria-live="polite"></p>
+      <a class="auth-link" id="pair-link" href="pair">Pair a passkey</a>
+    </div>
+
+    <div class="auth-verdict" id="home" hidden>
+      <div class="hanko" aria-hidden="true">認</div>
+      <p class="auth-sub">Signed in. The session ends after 8 hours, or when the node restarts.</p>
+    </div>
+
+    <dl class="auth-facts">
+      <dt>Network</dt><dd id="network">…</dd>
+      <dt>Node key</dt><dd class="is-mono" id="fingerprint">…</dd>
+      <dt hidden data-private>Mailbox</dt><dd class="is-mono" hidden data-private id="mailbox"></dd>
+      <dt hidden data-private>Wallet</dt><dd class="is-mono" hidden data-private id="wallet"></dd>
+    </dl>
+
+    <footer class="auth-foot">
+      <button class="auth-link" id="out" type="button" hidden>Sign out</button>
+      <p class="auth-host">Passkeys work only on this address: <span id="host"></span></p>
+    </footer>
+  </section>
+</main>
+</body>
+</html>

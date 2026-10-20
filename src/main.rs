@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State as AxState};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -51,9 +51,21 @@ fn public(cfg: &config::Config, node: &setup::Node) -> Public {
 /// The console's static files, built into the binary (no file serving from disk).
 fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
     Some(match path {
+        "" => (
+            "text/html; charset=utf-8",
+            include_bytes!("../console/index.html"),
+        ),
         "pair" => (
             "text/html; charset=utf-8",
             include_bytes!("../console/pair.html"),
+        ),
+        "passkey.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../console/passkey.js"),
+        ),
+        "console.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../console/console.js"),
         ),
         "pair.js" => (
             "text/javascript; charset=utf-8",
@@ -108,7 +120,8 @@ impl State {
 fn pair_status(e: &console::PairError) -> StatusCode {
     use console::PairError::*;
     match e {
-        NoCode | Expired | Ceremony => StatusCode::GONE,
+        NoCode | Expired | Ceremony | LoginGone => StatusCode::GONE,
+        NotPaired => StatusCode::CONFLICT,
         Wrong | Rejected => StatusCode::FORBIDDEN,
         Full => StatusCode::CONFLICT,
         Store => StatusCode::INTERNAL_SERVER_ERROR,
@@ -159,6 +172,91 @@ async fn pair_finish(
     }
 }
 
+/// The session token from the `__Host-` cookie, if any.
+fn session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|kv| kv.trim().strip_prefix(console::COOKIE)?.strip_prefix('='))
+}
+
+fn session_cookie(token: &str, max_age: u64) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}",
+        console::COOKIE
+    ))
+    .expect("cookie")
+}
+
+async fn login_start(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    let c = match st.console(&headers) {
+        Ok(c) => c,
+        Err((status, msg)) => return error(status, msg),
+    };
+    match c.login_start() {
+        Ok((ceremony, options)) => {
+            Json(json!({ "ceremony": ceremony, "options": options })).into_response()
+        }
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
+async fn login_finish(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let c = match st.console(&headers) {
+        Ok(c) => c,
+        Err((status, msg)) => return error(status, msg),
+    };
+    let (Some(ceremony), Ok(credential)) = (
+        body["ceremony"].as_str(),
+        serde_json::from_value(body["credential"].clone()),
+    ) else {
+        return error(StatusCode::BAD_REQUEST, "ceremony or credential is missing");
+    };
+    match c.login_finish(ceremony, &credential) {
+        Ok(token) => (
+            [(
+                header::SET_COOKIE,
+                session_cookie(&token, console::SESSION_TTL.as_secs()),
+            )],
+            Json(json!({ "ok": true })),
+        )
+            .into_response(),
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
+async fn session(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    let open = st
+        .console
+        .as_ref()
+        .zip(session_token(&headers))
+        .is_some_and(|(c, t)| c.session(t));
+    let paired = st.console.as_ref().is_some_and(|c| !c.stored().is_empty());
+    Json(json!({ "signed_in": open, "paired": paired, "console": st.console.is_some() }))
+        .into_response()
+}
+
+async fn logout(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    let c = match st.console(&headers) {
+        Ok(c) => c,
+        Err((status, msg)) => return error(status, msg),
+    };
+    if let Some(t) = session_token(&headers) {
+        c.logout(t);
+    }
+    (
+        [(header::SET_COOKIE, session_cookie("", 0))],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
 async fn console_file(Path(path): Path<String>) -> Response {
     match asset(&path) {
         Some((mime, bytes)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
@@ -190,6 +288,15 @@ fn app(st: State) -> Router {
         .route("/node/info", get(info))
         .route("/node/console/pair/start", post(pair_start))
         .route("/node/console/pair/finish", post(pair_finish))
+        .route("/node/console/login/start", post(login_start))
+        .route("/node/console/login/finish", post(login_finish))
+        .route("/node/console/session", get(session))
+        .route("/node/console/logout", post(logout))
+        .route("/console/", get(|| console_file(Path(String::new()))))
+        .route(
+            "/console",
+            get(|| async { Redirect::permanent("/console/") }),
+        )
         .route("/console/{*path}", get(console_file))
         .with_state(st)
         .layer(SetResponseHeaderLayer::overriding(
