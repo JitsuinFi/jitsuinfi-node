@@ -429,4 +429,16 @@ mod tests {
             Some(&hex(&fin.verifying_key().to_bytes()))
         ));
     }
+
+    #[test]
+    fn entries_and_seals_are_read_only_for_their_own_deal() {
+        let h = json!({ "type": "deal.entry", "n": "aa", "body": { "memo": "!!" } });
+        assert!(read_entry(&h, "aa").is_err());
+        assert!(read_entry(&h, "bb")
+            .unwrap_err()
+            .contains("not the board entry"));
+        let s = json!({ "type": "deal.seal", "n": "aa", "body": { "seal": "AAAA", "index": 0 } });
+        assert!(read_seal(&s, "aa").unwrap_err().contains("not a seal"));
+        assert!(read_seal(&s, "bb").is_err());
+    }
 }
