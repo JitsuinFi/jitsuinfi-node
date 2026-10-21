@@ -689,6 +689,29 @@ async fn fund_get(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
+/// HNK-30.T22: a fresh shielded address of the fund's wallet for one member's deposits, so the
+/// manager sees whose deposit arrived without the members sharing one address.
+async fn fund_deposit_address(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let (bin, dir, b) = (
+        st.devtool.clone(),
+        st.wallet.wallet_dir().to_path_buf(),
+        st.board.clone(),
+    );
+    match tokio::task::spawn_blocking(move || {
+        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+        deals::new_address(&bin, &dir)
+    })
+    .await
+    .expect("wallet task")
+    {
+        Ok(a) => Json(json!({ "address": a })).into_response(),
+        Err(e) => error(StatusCode::BAD_GATEWAY, &e),
+    }
+}
+
 /// Records a deposit the wallet received (mined) for a member, and sends the member a receipt
 /// with the withdraw token of the new units.
 async fn fund_deposit(
@@ -800,7 +823,8 @@ async fn fund_plan(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
         Ok(l) => l,
         Err(e) => return fund_error(e),
     };
-    let plan = l.plan(fund::assets(&view), view.cash_zat);
+    let mut plan = l.plan(fund::assets(&view), view.cash_zat);
+    plan.portfolio = Some(fund::portfolio(&view, (unix_now() / 86_400) as u32));
     let id = message::random_id();
     let out = json!({ "plan_id": id, "plan": plan, "paid_zat": plan.paid_zat() });
     st.plans.lock().unwrap().insert(id, plan);
@@ -949,7 +973,7 @@ async fn fund_close(
     for leaf in &l.leaves {
         let (Ok(to), Some(body)) = (
             message::unhex::<32>(&leaf.mailbox_pk),
-            fund::path_body(&tree, leaf, plan.period),
+            fund::path_body(&tree, leaf, plan.period, plan.portfolio.as_ref()),
         ) else {
             continue;
         };
@@ -1955,6 +1979,10 @@ fn app(st: State) -> Router {
         .route("/node/console/reputation", post(reputation_request))
         .route("/node/console/fund", get(fund_get))
         .route("/node/console/fund/deposits", post(fund_deposit))
+        .route(
+            "/node/console/fund/deposit-address",
+            post(fund_deposit_address),
+        )
         .route("/node/console/fund/withdrawals/{id}", post(fund_queue))
         .route("/node/console/fund/plan", post(fund_plan))
         .route("/node/console/fund/close", post(fund_close))

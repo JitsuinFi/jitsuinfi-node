@@ -130,6 +130,57 @@ pub struct Plan {
     pub short: bool,
     /// The ledger the plan was made from; a close refuses a ledger that changed since.
     pub ledger: String,
+    /// HNK-30.T22: what the fund holds, in aggregate, sent to members with their paths.
+    pub portfolio: Option<Portfolio>,
+}
+
+/// The fund's receivables in aggregate (HNK-30.T22): counts, sums and how far the open ones are
+/// from their due dates; no N, no party. The same numbers a member computes with the viewing key
+/// (`jitsuin fund`); here they arrive with the period's path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Portfolio {
+    pub cash_zat: u64,
+    pub open: u32,
+    pub open_zat: u64,
+    pub overdue: u32,
+    pub overdue_zat: u64,
+    pub repaid: u32,
+    /// Open receivables due within 30 days, 31 – 90 days, later.
+    pub due_within: [u32; 3],
+}
+
+pub fn portfolio(view: &FundView, today: u32) -> Portfolio {
+    let mut p = Portfolio {
+        cash_zat: view.cash_zat,
+        open: 0,
+        open_zat: 0,
+        overdue: 0,
+        overdue_zat: 0,
+        repaid: 0,
+        due_within: [0; 3],
+    };
+    for r in &view.receivables {
+        match r.status {
+            ReceivableStatus::Open => {
+                p.open += 1;
+                p.open_zat += r.outstanding_zat();
+                let days = r.due_date.saturating_sub(today);
+                p.due_within[if days <= 30 {
+                    0
+                } else if days <= 90 {
+                    1
+                } else {
+                    2
+                }] += 1;
+            }
+            ReceivableStatus::Overdue => {
+                p.overdue += 1;
+                p.overdue_zat += r.outstanding_zat();
+            }
+            ReceivableStatus::Repaid => p.repaid += 1,
+        }
+    }
+    p
 }
 
 impl Plan {
@@ -305,6 +356,7 @@ impl Ledger {
             held,
             short,
             ledger: self.digest(),
+            portfolio: None,
         }
     }
 
@@ -420,17 +472,26 @@ pub fn message(
 }
 
 /// The `fund.merkle_path` body for one leaf after a close.
-pub fn path_body(tree: &UnitTree, leaf: &Leaf, period: u32) -> Option<Value> {
+pub fn path_body(
+    tree: &UnitTree,
+    leaf: &Leaf,
+    period: u32,
+    portfolio: Option<&Portfolio>,
+) -> Option<Value> {
     let id = unhex::<32>(&leaf.id).ok()?;
     let (root, total) = tree.root();
-    Some(json!({
+    let mut b = json!({
         "period": period,
         "leaf_id": leaf.id,
         "units": leaf.units,
         "root": hex(&root),
         "total": total,
         "path": hex(&units::path_to_bytes(&tree.path(&id)?)),
-    }))
+    });
+    if let Some(p) = portfolio {
+        b["portfolio"] = serde_json::to_value(p).ok()?;
+    }
+    Some(b)
 }
 
 /// A member's mailbox key, from 64 hex characters or their contact card.
@@ -588,7 +649,7 @@ mod tests {
         let t = l.tree();
         let (root, total) = t.root();
         for leaf in &l.leaves {
-            let b = path_body(&t, leaf, 1).unwrap();
+            let b = path_body(&t, leaf, 1, None).unwrap();
             let path = units::path_from_bytes(
                 &(0..b["path"].as_str().unwrap().len() / 2)
                     .map(|i| {
@@ -606,6 +667,39 @@ mod tests {
                 total
             ));
         }
+    }
+
+    #[test]
+    fn the_portfolio_counts_receivables_without_naming_them() {
+        use jitsuin_flow::fund::Receivable;
+        let r = |due: u32, face: u64, repaid: u64, status| Receivable {
+            nullifier: [1; 32],
+            face_zat: face,
+            due_date: due,
+            advance_zat: 1,
+            advance_txid: "t".into(),
+            repaid_zat: repaid,
+            status,
+        };
+        let view = FundView {
+            cash_zat: 500,
+            receivables: vec![
+                r(110, 1_000, 0, ReceivableStatus::Open),
+                r(150, 2_000, 500, ReceivableStatus::Open),
+                r(400, 3_000, 0, ReceivableStatus::Open),
+                r(50, 4_000, 0, ReceivableStatus::Overdue),
+                r(60, 5_000, 5_000, ReceivableStatus::Repaid),
+            ],
+            root: None,
+            ignored_roots: 0,
+        };
+        let p = portfolio(&view, 100);
+        assert_eq!(
+            (p.open, p.open_zat, p.overdue, p.overdue_zat, p.repaid),
+            (3, 5_500, 1, 4_000, 1)
+        );
+        assert_eq!(p.due_within, [1, 1, 1]);
+        assert!(!serde_json::to_string(&p).unwrap().contains("0101"));
     }
 
     #[test]
