@@ -17,7 +17,7 @@ blake2b_simd = "=1.0.5"
 ed25519-dalek = "2.2"
 # Approved by the user 2026-10-20: HTTP server and console (behind Railway's HTTPS edge).
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["set-header"] }
 rand = "0.9"
 # Approved by the user 2026-10-20: HTTPS client to the relay (rustls, no OpenSSL).

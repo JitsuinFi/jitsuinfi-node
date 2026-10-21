@@ -9,6 +9,7 @@ mod buyers;
 mod config;
 mod console;
 mod directory;
+mod fund;
 mod keys;
 mod mail;
 mod message;
@@ -111,6 +112,12 @@ struct State {
     financier: Arc<ed25519_dalek::SigningKey>,
     /// Buyers the financier knows from KYC (HNK-26.T7).
     buyers: Arc<buyers::Registry>,
+    /// The financier's spending wallet: deposits are checked in it, payouts paid from it.
+    wallet: Arc<jitsuin_wallet::Devtool>,
+    /// One change of the fund ledger at a time (HNK-30.T23).
+    fund: Arc<tokio::sync::Mutex<()>>,
+    /// Close plans waiting for their passkey approval, by id.
+    plans: Arc<std::sync::Mutex<std::collections::HashMap<String, fund::Plan>>>,
 }
 
 impl State {
@@ -258,13 +265,24 @@ async fn device_remove(
 async fn approve_start(
     AxState(st): AxState<State>,
     headers: HeaderMap,
-    Json(intent): Json<pay::Intent>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Err((status, msg)) = st.signed_in(&headers, true) {
         return error(status, msg);
     }
     let c = st.console.as_deref().expect("signed in implies a console");
-    match c.approve_start(intent.hash()) {
+    // a fund close plan (HNK-30.T23) by its id, or one advance
+    let intent = match body["plan"].as_str() {
+        Some(id) => match st.plans.lock().unwrap().get(id) {
+            Some(p) => p.hash(),
+            None => return error(StatusCode::NOT_FOUND, "make the close plan again"),
+        },
+        None => match serde_json::from_value::<pay::Intent>(body) {
+            Ok(i) => i.hash(),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "name the payment to approve"),
+        },
+    };
+    match c.approve_start(intent) {
         Ok((ceremony, options)) => {
             Json(json!({ "ceremony": ceremony, "options": options })).into_response()
         }
@@ -575,6 +593,330 @@ async fn reputation_request(AxState(st): AxState<State>, headers: HeaderMap) -> 
             &format!("the request did not reach the provider: {e}"),
         ),
     }
+}
+
+fn fund_error(e: impl std::fmt::Display) -> Response {
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &format!("the fund ledger could not be read or saved: {e}"),
+    )
+}
+
+/// The wallet's transactions and balance, after a sync (zcash-devtool blocks: off the runtime).
+async fn wallet_state(st: &State) -> Result<(Vec<jitsuin_wallet::WalletTx>, u64), String> {
+    let w = st.wallet.clone();
+    tokio::task::spawn_blocking(move || {
+        w.sync()?;
+        w.enhance()?;
+        Ok::<_, jitsuin_wallet::Error>((w.list_tx()?, w.balance_zat()?))
+    })
+    .await
+    .expect("wallet task")
+    .map_err(|e| format!("the wallet could not sync: {e}"))
+}
+
+async fn send_fund(st: &State, kind: &str, to: &[u8; 32], body: Value) -> Result<(), String> {
+    let me = message::unhex::<32>(&st.public.mailbox_pk)?;
+    let bytes = fund::message(kind, &st.financier, &me, to, body, unix_now())?;
+    st.mail
+        .send(to, &bytes)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The fund at a glance for its manager: period, price, units, the queue, past closes.
+async fn fund_get(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    let l = match fund::Ledger::load(&st.data_dir) {
+        Ok(l) => l,
+        Err(e) => return fund_error(e),
+    };
+    Json(json!({
+        "period": l.period,
+        "nav": l.nav,
+        "total_units": l.total_units(),
+        "leaves": l.leaves.len(),
+        "deposits": l.deposits.len(),
+        "queue": l.queue,
+        "closes": l.closes.iter().rev().take(12).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// Records a deposit the wallet received (mined) for a member, and sends the member a receipt
+/// with the withdraw token of the new units.
+async fn fund_deposit(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let (Some(member), Some(txid)) = (
+        body["member"].as_str().and_then(fund::member_mailbox),
+        body["txid"].as_str().map(str::trim),
+    ) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "give the member's contact card and the deposit's transaction id",
+        );
+    };
+    let (txs, _) = match wallet_state(&st).await {
+        Ok(w) => w,
+        Err(msg) => return error(StatusCode::BAD_GATEWAY, &msg),
+    };
+    let Some(amount) = fund::received(&txs, txid).filter(|a| *a > 0) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "the wallet has no mined deposit with that transaction id yet",
+        );
+    };
+    let _g = st.fund.lock().await;
+    let mut l = match fund::Ledger::load(&st.data_dir) {
+        Ok(l) => l,
+        Err(e) => return fund_error(e),
+    };
+    let mut token = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut token);
+    let units = match l.deposit(&member, amount, txid, &token) {
+        Ok(u) => u,
+        Err(msg) => return error(StatusCode::CONFLICT, &msg),
+    };
+    if let Err(e) = l.save(&st.data_dir) {
+        return fund_error(e);
+    }
+    let receipt = json!({
+        "period": l.period,
+        "deposit_txid": txid,
+        "amount_zat": amount,
+        "units": units,
+        "nav": l.nav,
+        "withdraw_token": hex(&token),
+    });
+    let sent = send_fund(&st, "fund.receipt", &member, receipt).await;
+    Json(json!({ "ok": true, "amount_zat": amount, "units": units, "receipt_sent": sent.is_ok() }))
+        .into_response()
+}
+
+/// Queues a member's `fund.withdraw` from the mailbox for the end of the period.
+async fn fund_queue(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let Some(h) = st.mail.header(&id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "list the mailbox again; this request is not in it",
+        );
+    };
+    let w = match fund::read_withdraw(&h) {
+        Ok(r) => r,
+        Err(msg) => return error(StatusCode::UNPROCESSABLE_ENTITY, &msg),
+    };
+    let _g = st.fund.lock().await;
+    let mut l = match fund::Ledger::load(&st.data_dir) {
+        Ok(l) => l,
+        Err(e) => return fund_error(e),
+    };
+    match l.withdraw(&w.token, w.units, &w.address, &id, unix_now()) {
+        Ok(u) => match l.save(&st.data_dir) {
+            Ok(()) => Json(json!({ "ok": true, "units": u, "period": l.period })).into_response(),
+            Err(e) => fund_error(e),
+        },
+        Err(msg) => error(StatusCode::CONFLICT, &msg),
+    }
+}
+
+/// Values the fund from the wallet and plans the close: the payouts the passkey will approve.
+async fn fund_plan(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let (txs, cash) = match wallet_state(&st).await {
+        Ok(w) => w,
+        Err(msg) => return error(StatusCode::BAD_GATEWAY, &msg),
+    };
+    let manager = st.financier.verifying_key().to_bytes();
+    let view = jitsuin_flow::fund::fund_view(
+        &txs,
+        cash,
+        &manager,
+        (unix_now() / 86_400) as u32,
+        GRACE_DAYS,
+    );
+    let _g = st.fund.lock().await;
+    let l = match fund::Ledger::load(&st.data_dir) {
+        Ok(l) => l,
+        Err(e) => return fund_error(e),
+    };
+    let plan = l.plan(fund::assets(&view), view.cash_zat);
+    let id = message::random_id();
+    let out = json!({ "plan_id": id, "plan": plan, "paid_zat": plan.paid_zat() });
+    st.plans.lock().unwrap().insert(id, plan);
+    Json(out).into_response()
+}
+
+/// Days after the due date before an unpaid receivable counts as overdue.
+const GRACE_DAYS: u32 = 7;
+
+/// Runs an approved close: pays the queue, records it, signs the new root into JTLR, and sends
+/// every member their path and every paid member their payout receipt.
+async fn fund_close(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let c = st.console.as_deref().expect("signed in implies a console");
+    let (Some(id), Some(approval)) = (body["plan_id"].as_str(), body["approval"].as_str()) else {
+        return error(StatusCode::BAD_REQUEST, "give the plan and its approval");
+    };
+    let Some(plan) = st.plans.lock().unwrap().get(id).cloned() else {
+        return error(StatusCode::NOT_FOUND, "make the close plan again");
+    };
+    if let Err(e) = c.take_approval(approval, &plan.hash()) {
+        return error(pair_status(&e), e.message());
+    }
+    let _g = st.fund.lock().await;
+    let mut l = match fund::Ledger::load(&st.data_dir) {
+        Ok(l) => l,
+        Err(e) => return fund_error(e),
+    };
+    if l.digest() != plan.ledger {
+        return error(
+            StatusCode::CONFLICT,
+            "the fund changed since this plan: make the plan again",
+        );
+    }
+    st.plans.lock().unwrap().remove(id);
+    // 1. the payouts, one transaction
+    let payout_txid = if plan.payouts.is_empty() {
+        None
+    } else {
+        let w = st.wallet.clone();
+        let payments: Vec<_> = plan
+            .payouts
+            .iter()
+            .map(|p| jitsuin_wallet::Payment {
+                address: p.address.clone(),
+                amount_zat: p.amount_zat,
+                memo: None,
+            })
+            .collect();
+        match tokio::task::spawn_blocking(move || w.pay(&payments))
+            .await
+            .expect("wallet task")
+        {
+            Ok(t) => Some(t),
+            Err(e) => {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("the payouts were not sent: {e}"),
+                )
+            }
+        }
+    };
+    // 2. the ledger, saved before anything else can fail: the money has left
+    let paid = match l.apply(&plan, || {
+        let mut t = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut t);
+        t
+    }) {
+        Ok(p) => p,
+        Err(msg) => return error(StatusCode::CONFLICT, &msg),
+    };
+    let tree = l.tree();
+    let (root, total) = tree.root();
+    l.closes.push(fund::Close {
+        period: plan.period,
+        root: hex(&root),
+        total_units: total,
+        nav: plan.nav,
+        paid_zat: plan.paid_zat(),
+        payout_txid: payout_txid.clone(),
+        root_txid: String::new(),
+        held: plan.held,
+    });
+    if let Err(e) = l.save(&st.data_dir) {
+        return fund_error(e);
+    }
+    // 3. the root, signed by the manager key, as a self-send members see with the viewing key
+    let key = st.financier.clone();
+    let w = st.wallet.clone();
+    let period = plan.period;
+    let root_txid = tokio::task::spawn_blocking(move || {
+        let r = jitsuin_core::LiabilityRoot::sign(&key, period, root, total);
+        let memo = jitsuin_core::memo::encode(&[jitsuin_core::MemoItem::Root(r)])
+            .map_err(|e| e.to_string())?;
+        let own = w.default_address().map_err(|e| e.to_string())?;
+        w.pay(&[jitsuin_wallet::Payment {
+            address: own,
+            amount_zat: jitsuin_flow::fund::ROOT_POST_ZAT,
+            memo: Some(jitsuin_wallet::PaymentMemo::Arbitrary(memo)),
+        }])
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .expect("wallet task");
+    if let Ok(t) = &root_txid {
+        if let Some(last) = l.closes.last_mut() {
+            last.root_txid = t.clone();
+        }
+        if let Err(e) = l.save(&st.data_dir) {
+            return fund_error(e);
+        }
+    }
+    // 4. the mail: paths to every member, payout receipts to the paid ones
+    let mut undelivered = 0;
+    for p in &paid {
+        let Ok(to) = message::unhex::<32>(&p.mailbox_pk) else {
+            continue;
+        };
+        let body = json!({
+            "period": plan.period,
+            "units": p.payout.units,
+            "amount_zat": p.payout.amount_zat,
+            "nav": plan.nav,
+            "txid": payout_txid,
+            "next_token": p.next.as_ref().map(|(t, _)| hex(t)),
+        });
+        if send_fund(&st, "fund.payout", &to, body).await.is_err() {
+            undelivered += 1;
+        }
+    }
+    for leaf in &l.leaves {
+        let (Ok(to), Some(body)) = (
+            message::unhex::<32>(&leaf.mailbox_pk),
+            fund::path_body(&tree, leaf, plan.period),
+        ) else {
+            continue;
+        };
+        if send_fund(&st, "fund.merkle_path", &to, body).await.is_err() {
+            undelivered += 1;
+        }
+    }
+    Json(json!({
+        "ok": true,
+        "period": plan.period,
+        "paid_zat": plan.paid_zat(),
+        "payout_txid": payout_txid,
+        "root": hex(&root),
+        "total_units": total,
+        "root_txid": root_txid.as_ref().ok(),
+        "root_error": root_txid.err(),
+        "undelivered": undelivered,
+    }))
+    .into_response()
 }
 
 const DEALS_DIR: &str = "deals";
@@ -892,6 +1234,11 @@ fn app(st: State) -> Router {
         .route("/node/console/buyers", get(buyers_list).post(buyers_add))
         .route("/node/console/mandate", get(mandate_get).post(mandate_set))
         .route("/node/console/reputation", post(reputation_request))
+        .route("/node/console/fund", get(fund_get))
+        .route("/node/console/fund/deposits", post(fund_deposit))
+        .route("/node/console/fund/withdrawals/{id}", post(fund_queue))
+        .route("/node/console/fund/plan", post(fund_plan))
+        .route("/node/console/fund/close", post(fund_close))
         .route("/node/console/buyers/{pk}", delete(buyers_remove))
         .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
         .route("/console/", get(|| console_file(Path(String::new()))))
@@ -1060,6 +1407,9 @@ async fn main() {
                 mail: Arc::new(mail::Mail::new(relay, node.keys.mailbox())),
                 financier: Arc::new(node.keys.financier()),
                 buyers: Arc::new(buyers::Registry::load(&cfg.data_dir).unwrap_or_else(|e| fail(e))),
+                wallet: Arc::new(node.wallet.clone()),
+                fund: Arc::default(),
+                plans: Arc::default(),
             };
             axum::serve(listener, app(st))
                 .with_graceful_shutdown(async {
