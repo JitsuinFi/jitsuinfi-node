@@ -54,6 +54,9 @@ pub struct Meta {
     pub paid_zat: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_txid: Option<String>,
+    /// HNK-26.T13: the repayment evidence (JTSE, base64url) while claimed, disputed or overdue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
     /// The supplier's and the buyer's seals (base64url), kept for the bundle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seals: Vec<String>,

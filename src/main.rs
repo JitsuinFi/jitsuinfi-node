@@ -1333,10 +1333,21 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                     let buyer = flow.deal().invoice.buyer_pk;
                     let today = (unix_now() / 86_400) as u32;
                     let grace = mandate::PrivateMandate::load(&st.data_dir).grace();
-                    let (status, paid, posted) = tokio::task::spawn_blocking(move || {
+                    let (status, paid, posted, evidence) = tokio::task::spawn_blocking(move || {
+                        use jitsuin_flow::settlement::{Evidence, Status};
                         let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
                         let r = fin.repayment(&doc, &buyer).map_err(|e| e.to_string())?;
                         let status = r.status(&doc, today, grace);
+                        // HNK-26.T13: a claim without a covering payment, a dispute or an overdue
+                        // invoice gets an evidence file anyone can re-check (JTSE)
+                        let evidence =
+                            matches!(status, Status::Claimed | Status::Disputed | Status::Overdue)
+                                .then(|| {
+                                    Evidence::new(&doc, &buyer, &r, today, grace)
+                                        .to_bytes()
+                                        .ok()
+                                })
+                                .flatten();
                         let posted = if status == jitsuin_flow::settlement::Status::Settled {
                             Some(
                                 fin.post_settled(&doc, &buyer, &r)
@@ -1346,10 +1357,13 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                         } else {
                             None
                         };
-                        Ok::<_, String>((format!("{status:?}"), r.paid_zat, posted))
+                        Ok::<_, String>((format!("{status:?}"), r.paid_zat, posted, evidence))
                     })
                     .await
                     .expect("wallet task")?;
+                    meta.evidence = evidence.map(|e| {
+                        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, e)
+                    });
                     meta.repayment = Some(status);
                     meta.paid_zat = Some(paid);
                     meta.settled_txid = posted;
@@ -1416,6 +1430,7 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["repayment"] = meta.repayment.clone().into();
     v["paid_zat"] = meta.paid_zat.into();
     v["settled_txid"] = meta.settled_txid.clone().into();
+    v["evidence"] = meta.evidence.clone().into();
     v["bundle_sent"] = meta.bundle_sent.into();
     v["history_requested"] = meta.history_requested.into();
     v["proof"] = meta.proof.clone().into();
