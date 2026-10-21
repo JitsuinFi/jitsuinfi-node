@@ -1195,6 +1195,15 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                         }
                     }
                     if let [Some(s0), Some(s1)] = seals {
+                        meta.seals = [&s0, &s1]
+                            .iter()
+                            .map(|s| {
+                                base64::Engine::encode(
+                                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                                    s.to_bytes(),
+                                )
+                            })
+                            .collect();
                         flow.apply(Event::AssignmentSealed(vec![s0, s1]))
                             .map_err(|e| format!("the seals do not hold: {e}"))?;
                     }
@@ -1222,6 +1231,58 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                     })
                     .map_err(|e| e.to_string())?;
                 }
+                // HNK-26.T11–T12: the buyer pays this wallet at maturity; once mined payments
+                // with the buyer's receipt and claim cover the amount, the node countersigns the
+                // claim into a `settled` entry on the board, once.
+                S::Done { .. } if meta.settled_txid.is_none() => {
+                    let fin = financier(st).await?;
+                    let b = st.board.clone();
+                    let doc = jitsuin_core::SettlementDoc::for_assignment(&flow.deal().assignment);
+                    let buyer = flow.deal().invoice.buyer_pk;
+                    let today = (unix_now() / 86_400) as u32;
+                    let (status, paid, posted) = tokio::task::spawn_blocking(move || {
+                        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+                        let r = fin.repayment(&doc, &buyer).map_err(|e| e.to_string())?;
+                        let status = r.status(&doc, today, GRACE_DAYS);
+                        let posted = if status == jitsuin_flow::settlement::Status::Settled {
+                            Some(
+                                fin.post_settled(&doc, &buyer, &r)
+                                    .map_err(|e| format!("posting the settled entry failed: {e}"))?
+                                    .0,
+                            )
+                        } else {
+                            None
+                        };
+                        Ok::<_, String>((format!("{status:?}"), r.paid_zat, posted))
+                    })
+                    .await
+                    .expect("wallet task")?;
+                    meta.repayment = Some(status);
+                    meta.paid_zat = Some(paid);
+                    meta.settled_txid = posted;
+                }
+                // HNK-26.T18: once settled, the bundle goes to the supplier and the buyer
+                S::Done { .. } if !meta.bundle_sent && meta.seals.len() == 2 => {
+                    let bytes = deals::bundle(
+                        &flow,
+                        &accepted.buyer_signature,
+                        &meta.seals,
+                        &st.financier,
+                    )?;
+                    let mut to = vec![message::unhex::<32>(&accepted.supplier_mailbox_pk)?];
+                    if let Some(b) = &accepted.buyer_mailbox_pk {
+                        to.push(message::unhex::<32>(b)?);
+                    }
+                    for t in to {
+                        let m =
+                            deals::bundle_message(&st.financier, &me, &t, n, &bytes, unix_now())?;
+                        st.mail
+                            .send(&t, &m)
+                            .await
+                            .map_err(|e| format!("the bundle did not go out: {e}"))?;
+                    }
+                    meta.bundle_sent = true;
+                }
                 S::Pay { .. } | S::Done { .. } | S::Stopped(_) => {}
             }
             Ok(())
@@ -1248,6 +1309,10 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["advance_zat"] = flow.deal().advance_zat.into();
     v["due_date"] = flow.deal().invoice.due_date.into();
     v["letter_sent"] = meta.letter_sent.into();
+    v["repayment"] = meta.repayment.clone().into();
+    v["paid_zat"] = meta.paid_zat.into();
+    v["settled_txid"] = meta.settled_txid.clone().into();
+    v["bundle_sent"] = meta.bundle_sent.into();
     v["problem"] = meta.problem.clone().into();
     if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
         let i = pay::Intent::of(flow);
