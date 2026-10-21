@@ -8,6 +8,7 @@ mod board;
 mod buyers;
 mod config;
 mod console;
+mod directory;
 mod keys;
 mod mail;
 mod message;
@@ -439,6 +440,95 @@ async fn buyers_remove(
     }
 }
 
+const MANDATE_FILE: &str = "mandate.json";
+
+/// The financier's public mandate (HNK-30.T19, D-47), as it last sent it to the directory.
+async fn mandate_get(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    let saved: Value = std::fs::read(st.data_dir.join(MANDATE_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    Json(json!({ "mandate": saved })).into_response()
+}
+
+/// Saves the public mandate and sends it, signed with the financier key, to the node provider's
+/// mailbox as a `financier.listing`; the provider lists it in the directory (D-47).
+async fn mandate_set(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let Some(name) = st.name() else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "set your name first: suppliers see it in the directory",
+        );
+    };
+    let mandate = match serde_json::from_value::<directory::Mandate>(body.clone()) {
+        Ok(m) => m,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "give the amount range, the longest tenor and the KYC rule",
+            )
+        }
+    };
+    if let Err(e) = directory::listing(
+        &name,
+        &st.public.contact,
+        &st.public.financier_pk,
+        mandate.clone(),
+        unix_now(),
+    ) {
+        return error(StatusCode::BAD_REQUEST, &e);
+    }
+    let Ok(my_mailbox) = message::unhex::<32>(&st.public.mailbox_pk) else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the node has no mailbox key",
+        );
+    };
+    let bytes = match directory::listing_message(
+        &st.financier,
+        &my_mailbox,
+        &name,
+        &st.public.contact,
+        &mandate,
+        unix_now(),
+    ) {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let to = match directory::provider_mailbox() {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    if let Err(e) = st.mail.send(&to, &bytes).await {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            &format!("the listing did not reach the provider: {e}"),
+        );
+    }
+    if std::fs::write(
+        st.data_dir.join(MANDATE_FILE),
+        serde_json::to_vec(&mandate).unwrap(),
+    )
+    .is_err()
+    {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sent, but the node could not save the mandate",
+        );
+    }
+    Json(json!({ "ok": true, "mandate": mandate })).into_response()
+}
+
 const DEALS_DIR: &str = "deals";
 
 fn unix_now() -> u64 {
@@ -752,6 +842,7 @@ fn app(st: State) -> Router {
         .route("/node/mail/{id}", delete(mail_remove))
         .route("/node/console/offers/{id}/accept", post(offer_accept))
         .route("/node/console/buyers", get(buyers_list).post(buyers_add))
+        .route("/node/console/mandate", get(mandate_get).post(mandate_set))
         .route("/node/console/buyers/{pk}", delete(buyers_remove))
         .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
         .route("/console/", get(|| console_file(Path(String::new()))))
