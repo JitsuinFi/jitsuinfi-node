@@ -99,8 +99,9 @@ struct State {
     mail: Arc<mail::Mail>,
     board: Arc<board::Board>,
     data_dir: std::path::PathBuf,
-    /// The financier's display name (FINANCIER_NAME), shown only in its own console.
-    name: Option<String>,
+    /// The financier's display name, shown only in its own console: what the financier saved
+    /// (`financier-name.txt` in the volume), else FINANCIER_NAME from the provider.
+    name: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl State {
@@ -125,7 +126,20 @@ impl State {
     }
 }
 
+const NAME_FILE: &str = "financier-name.txt";
+
+/// A display name: printable, at most 60 characters, trimmed; `None` when empty.
+fn clean_name(n: &str) -> Option<String> {
+    let n: String = n.chars().filter(|c| !c.is_control()).take(60).collect();
+    let n = n.trim().to_string();
+    (!n.is_empty()).then_some(n)
+}
+
 impl State {
+    fn name(&self) -> Option<String> {
+        self.name.read().unwrap().clone()
+    }
+
     /// A request with an open console session; `write` also needs the console's own `Origin`.
     fn signed_in(
         &self,
@@ -145,6 +159,28 @@ impl State {
             _ => Err((StatusCode::UNAUTHORIZED, "sign in to the console first")),
         }
     }
+}
+
+/// The financier sets its own display name from a signed-in console.
+async fn set_name(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    let Some(name) = body["name"].as_str().and_then(clean_name) else {
+        return error(StatusCode::BAD_REQUEST, "type a name");
+    };
+    if std::fs::write(st.data_dir.join(NAME_FILE), &name).is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the node could not save the name",
+        );
+    }
+    *st.name.write().unwrap() = Some(name.clone());
+    Json(json!({ "ok": true, "name": name })).into_response()
 }
 
 /// "Add a device": a one-time pairing code (15 minutes) and its invite link, from a signed-in
@@ -326,7 +362,7 @@ async fn pair_start(
     };
     match c.start(code) {
         Ok((ceremony, options)) => {
-            Json(json!({ "ceremony": ceremony, "options": options, "name": st.name }))
+            Json(json!({ "ceremony": ceremony, "options": options, "name": st.name() }))
                 .into_response()
         }
         Err(e) => error(pair_status(&e), e.message()),
@@ -356,7 +392,7 @@ async fn pair_finish(
                     header::SET_COOKIE,
                     session_cookie(&token, console::SESSION_TTL.as_secs()),
                 )],
-                Json(json!({ "ok": true, "credentials": n, "name": st.name })),
+                Json(json!({ "ok": true, "credentials": n, "name": st.name() })),
             )
                 .into_response()
         }
@@ -431,7 +467,7 @@ async fn session(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
         .is_some_and(|(c, t)| c.session(t));
     let paired = st.console.as_ref().is_some_and(|c| !c.stored().is_empty());
     // The financier's name only to its own session: /node/console/session is public.
-    let name = if open { st.name.clone() } else { None };
+    let name = if open { st.name() } else { None };
     Json(json!({ "signed_in": open, "paired": paired, "console": st.console.is_some(), "name": name }))
         .into_response()
 }
@@ -497,6 +533,7 @@ fn app(st: State) -> Router {
         .route("/node/console/login/finish", post(login_finish))
         .route("/node/console/session", get(session))
         .route("/node/console/logout", post(logout))
+        .route("/node/console/name", post(set_name))
         .route("/node/console/devices", get(devices_list))
         .route("/node/console/devices/{id}", delete(device_remove))
         .route("/node/console/devices/code", post(device_code))
@@ -651,7 +688,12 @@ async fn main() {
             let st = State {
                 board,
                 data_dir: cfg.data_dir.clone(),
-                name: cfg.financier_name.clone(),
+                name: Arc::new(std::sync::RwLock::new(
+                    std::fs::read_to_string(cfg.data_dir.join(NAME_FILE))
+                        .ok()
+                        .and_then(|n| clean_name(&n))
+                        .or_else(|| cfg.financier_name.clone()),
+                )),
                 public: Arc::new(p),
                 console,
                 origin: cfg.node_origin.clone(),
@@ -668,5 +710,19 @@ async fn main() {
             eprintln!("unknown command {other}: use setup, info, pair, inbox or serve");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    #[test]
+    fn names_are_printable_trimmed_and_short() {
+        assert_eq!(
+            super::clean_name("  Kurogane Capital \n"),
+            Some("Kurogane Capital".into())
+        );
+        assert_eq!(super::clean_name("a\u{0}b"), Some("ab".into()));
+        assert_eq!(super::clean_name("   "), None);
+        assert_eq!(super::clean_name(&"x".repeat(80)).unwrap().len(), 60);
     }
 }

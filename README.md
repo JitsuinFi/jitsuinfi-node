@@ -44,7 +44,7 @@ A code is used up on its first correct try and dropped after five wrong ones. Th
 | `RELAY_URL` | relay base URL (default: the Railway relay) |
 | `NODE_ORIGIN` | the console's origin; defaults to `https://$RAILWAY_PUBLIC_DOMAIN` on Railway; without either the console is off |
 | `SETUP_CODE` | optional: the provider's code for the first console passkey (invite link `<origin>/console/pair#<code>`) |
-| `FINANCIER_NAME` | optional: the financier's display name, shown only to a code holder or its signed-in console |
+| `FINANCIER_NAME` | optional: a first display name for the financier; the financier changes it in the console (Profile), saved in `financier-name.txt` |
 | `PORT` | set by Railway |
 
 ## Deploy
