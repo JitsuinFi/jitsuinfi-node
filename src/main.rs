@@ -884,6 +884,7 @@ async fn fund_close(
         };
         let mut body = json!({
             "period": plan.period,
+            "leaf_id": p.payout.leaf,
             "units": p.payout.units,
             "amount_zat": p.payout.amount_zat,
             "nav": plan.nav,
