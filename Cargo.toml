@@ -7,17 +7,17 @@ publish = false
 description = "JitsuinFi financier node: wallet, deal state, relay mailbox and console (HNK-26)"
 
 [dependencies]
-# Pinned to a reviewed commit of jitsuinfi-zcash (main after PR #17).
-jitsuin-core = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "f06ed3d5100bab6c70e2583ef71d2a3d9643c7d4" }
-jitsuin-flow = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "f06ed3d5100bab6c70e2583ef71d2a3d9643c7d4" }
-jitsuin-board = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "f06ed3d5100bab6c70e2583ef71d2a3d9643c7d4" }
-jitsuin-wallet = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "f06ed3d5100bab6c70e2583ef71d2a3d9643c7d4" }
+# Pinned to a reviewed commit of jitsuinfi-zcash (main after PR #20).
+jitsuin-core = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "3063f18c089f617e221ac22c4eb7ee61507439e1" }
+jitsuin-flow = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "3063f18c089f617e221ac22c4eb7ee61507439e1" }
+jitsuin-board = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "3063f18c089f617e221ac22c4eb7ee61507439e1" }
+jitsuin-wallet = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "3063f18c089f617e221ac22c4eb7ee61507439e1" }
 # Same pins as the jitsuinfi-zcash workspace (D-10).
 blake2b_simd = "=1.0.5"
 ed25519-dalek = "2.2"
 # Approved by the user 2026-10-20: HTTP server and console (behind Railway's HTTPS edge).
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["set-header"] }
 rand = "0.9"
 # Approved by the user 2026-10-20: HTTPS client to the relay (rustls, no OpenSSL).
