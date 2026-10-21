@@ -8,6 +8,11 @@
 //! A code is used up on the first correct try, refused after it expires, and dropped after five
 //! wrong tries. Nothing secret is logged.
 //!
+//! Without a terminal (HNK-26.T20, D-43): the provider of a managed node sets `SETUP_CODE` and
+//! sends the financier the invite link `<origin>/console/pair#<code>`. That code pairs the first
+//! passkey only; once a passkey is paired it is refused. Five wrong tries lock it for 15 minutes.
+//! Further devices get a one-time code from "Add a device" in a signed-in console.
+//!
 //! Sessions (HNK-26.T3, BL-D21-17, flows F1.39 – F1.43): a one-time challenge (2 minutes) for
 //! the paired credentials, an assertion checked for origin, `rpIdHash`, user verification,
 //! signature and counter, then a random session token in a `__Host-` cookie (`Secure`,
@@ -107,13 +112,15 @@ pub enum PairError {
     LoginGone,
     /// No unused, unexpired approval for this exact payment.
     NotApproved,
+    /// Too many wrong setup-code tries; wait.
+    Locked,
 }
 
 impl PairError {
     pub fn message(&self) -> &'static str {
         match self {
-            PairError::NoCode => "no pairing code is waiting; run `jitsuin-node pair` on the node",
-            PairError::Expired => "the pairing code has expired; run `jitsuin-node pair` again",
+            PairError::NoCode => "no pairing code is waiting; ask your node provider for an invite link, or use Add a device in a signed-in console",
+            PairError::Expired => "the pairing code has expired; ask for a new invite link",
             PairError::Wrong => "the pairing code is not correct",
             PairError::Full => "this node already has the most console passkeys it keeps",
             PairError::Ceremony => "this pairing has expired or was already finished; start again",
@@ -121,6 +128,7 @@ impl PairError {
             PairError::Store => "the node could not save the passkey",
             PairError::NotPaired => "no passkey is paired with this console yet; pair one first",
             PairError::LoginGone => "this passkey request has expired or was already used; try again",
+            PairError::Locked => "too many wrong codes; wait 15 minutes and try again",
             PairError::NotApproved => "this payment has no passkey approval (or it expired, was used, or was for another payment)",
         }
     }
@@ -128,6 +136,10 @@ impl PairError {
 
 pub struct Console {
     webauthn: Webauthn,
+    /// SHA-256 of the provider's setup code (first passkey only).
+    setup: Option<String>,
+    /// Wrong setup-code tries, and the end of a lockout.
+    setup_fails: Mutex<(u32, Option<Instant>)>,
     user: Uuid,
     pairing: PathBuf,
     credentials: PathBuf,
@@ -175,7 +187,16 @@ pub fn new_code(data_dir: &Path) -> std::io::Result<String> {
 impl Console {
     /// `origin` is the console's own origin (NODE_ORIGIN), e.g. `https://node.example`; its host
     /// is the passkey `rp.id`.
-    pub fn new(origin: &str, data_dir: &Path, user: [u8; 16]) -> Result<Self, String> {
+    pub fn new(
+        origin: &str,
+        data_dir: &Path,
+        user: [u8; 16],
+        setup_code: Option<&str>,
+    ) -> Result<Self, String> {
+        if setup_code.is_some_and(|c| c.chars().filter(|c| c.is_ascii_alphanumeric()).count() < 16)
+        {
+            return Err("SETUP_CODE must have at least 16 letters or digits".into());
+        }
         let url = Url::parse(origin).map_err(|e| format!("NODE_ORIGIN: {e}"))?;
         let host = url.host_str().ok_or("NODE_ORIGIN has no host")?.to_string();
         if url.scheme() != "https" && host != "localhost" {
@@ -186,6 +207,8 @@ impl Console {
             .map_err(|e| format!("NODE_ORIGIN: {e}"))?;
         Ok(Console {
             webauthn,
+            setup: setup_code.map(code_hash),
+            setup_fails: Mutex::new((0, None)),
             user: Uuid::from_bytes(user),
             pairing: data_dir.join("pairing.json"),
             credentials: data_dir.join("console-credentials.json"),
@@ -208,6 +231,9 @@ impl Console {
     /// Checks and uses up the pairing code, then starts `create()`.
     pub fn start(&self, code: &str) -> Result<(String, CreationChallengeResponse), PairError> {
         let _g = self.lock.lock().unwrap();
+        if self.setup_matches(code, !self.stored().is_empty())? {
+            return self.registration();
+        }
         let mut p: Pairing = fs::read(&self.pairing)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -227,6 +253,39 @@ impl Console {
             return Err(PairError::Wrong);
         }
         fs::remove_file(&self.pairing).map_err(|_| PairError::Store)?;
+        self.registration()
+    }
+
+    /// True when `code` is the provider's setup code and it may still pair (no passkey yet).
+    /// Wrong tries count only while the setup code is the way in (no other code is waiting).
+    fn setup_matches(&self, code: &str, paired: bool) -> Result<bool, PairError> {
+        let Some(setup) = &self.setup else {
+            return Ok(false);
+        };
+        if paired {
+            return Ok(false);
+        }
+        let mut f = self.setup_fails.lock().unwrap();
+        if f.1.is_some_and(|until| Instant::now() < until) {
+            return Err(PairError::Locked);
+        }
+        if code_hash(code) == *setup {
+            *f = (0, None);
+            return Ok(true);
+        }
+        if !self.pairing.exists() {
+            f.0 += 1;
+            if f.0 >= MAX_TRIES {
+                *f = (0, Some(Instant::now() + CODE_TTL));
+                return Err(PairError::Locked);
+            }
+            return Err(PairError::Wrong);
+        }
+        Ok(false)
+    }
+
+    /// `create()` options for a new passkey, excluding the ones already paired.
+    fn registration(&self) -> Result<(String, CreationChallengeResponse), PairError> {
         let stored = self.stored();
         if stored.len() >= MAX_CREDENTIALS {
             return Err(PairError::Full);
@@ -458,7 +517,7 @@ mod tests {
     #[test]
     fn code_is_one_time_and_tolerates_format() {
         let d = dir("once");
-        let c = Console::new("http://localhost:8788", &d, [1; 16]).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
         assert_eq!(c.start("AAAA-BBBB").unwrap_err(), PairError::NoCode);
         let code = new_code(&d).unwrap();
         assert_eq!(code.len(), 19);
@@ -477,7 +536,7 @@ mod tests {
     #[test]
     fn wrong_tries_and_expiry_drop_the_code() {
         let d = dir("tries");
-        let c = Console::new("http://localhost:8788", &d, [1; 16]).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
         let code = new_code(&d).unwrap();
         for _ in 0..MAX_TRIES {
             assert_eq!(c.start("WRONG-CODE").unwrap_err(), PairError::Wrong);
@@ -499,7 +558,7 @@ mod tests {
     #[test]
     fn sign_in_needs_a_paired_passkey_and_a_live_challenge() {
         let d = dir("login");
-        let c = Console::new("http://localhost:8788", &d, [1; 16]).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
         assert_eq!(c.login_start().unwrap_err(), PairError::NotPaired);
         let cred: PublicKeyCredential = serde_json::from_value(serde_json::json!({
             "id": "AA", "rawId": "AA", "type": "public-key",
@@ -515,9 +574,36 @@ mod tests {
     }
 
     #[test]
+    fn the_setup_code_pairs_the_first_passkey_only() {
+        let d = dir("setup");
+        let setup = "SETU-PCOD-EFOR-NODE";
+        assert!(Console::new("http://localhost:8788", &d, [1; 16], Some("short")).is_err());
+        let c = Console::new("http://localhost:8788", &d, [1; 16], Some(setup)).unwrap();
+        // format-tolerant, and usable again until a passkey is actually paired
+        c.start(&setup.to_lowercase()).unwrap();
+        c.start(setup).unwrap();
+        // five wrong tries lock it
+        for _ in 0..MAX_TRIES - 1 {
+            assert_eq!(c.start("WRONG-WRONG-WRONG").unwrap_err(), PairError::Wrong);
+        }
+        assert_eq!(c.start("WRONG-WRONG-WRONG").unwrap_err(), PairError::Locked);
+        assert_eq!(
+            c.start(setup).unwrap_err(),
+            PairError::Locked,
+            "locked even for the right code"
+        );
+        // once a passkey is paired, the setup code no longer pairs
+        let c = Console::new("http://localhost:8788", &d, [1; 16], Some(setup)).unwrap();
+        assert!(c.setup_matches(setup, false).unwrap());
+        assert!(!c.setup_matches(setup, true).unwrap());
+        assert_eq!(c.start("ANY").unwrap_err(), PairError::Wrong);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn an_approval_pays_once_and_only_its_own_intent() {
         let d = dir("approve");
-        let c = Console::new("http://localhost:8788", &d, [1; 16]).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
         assert_eq!(c.approve_start([7; 32]).unwrap_err(), PairError::NotPaired);
         let id = c.grant_for_test([7; 32], Duration::ZERO);
         assert_eq!(
@@ -547,10 +633,10 @@ mod tests {
     #[test]
     fn origin_must_be_https_except_localhost() {
         let d = dir("origin");
-        assert!(Console::new("http://node.example", &d, [1; 16]).is_err());
-        assert!(Console::new("https://node.example", &d, [1; 16]).is_ok());
+        assert!(Console::new("http://node.example", &d, [1; 16], None).is_err());
+        assert!(Console::new("https://node.example", &d, [1; 16], None).is_ok());
         assert_eq!(
-            Console::new("https://node.example", &d, [1; 16])
+            Console::new("https://node.example", &d, [1; 16], None)
                 .unwrap()
                 .finish(
                     "x",

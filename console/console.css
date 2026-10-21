@@ -193,6 +193,9 @@ a.auth-button { text-decoration: none; }
   appearance: none; border: 0; background: none; padding: 4px 0;
   font: 600 13px/1.2 var(--f-body); color: var(--seal); cursor: pointer; text-decoration: none;
 }
+.invite { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.invite-link { margin: 0; width: 100%; padding: 12px 14px; border: 1px solid var(--rule); border-radius: 12px; background: var(--paper); font: 500 12.5px/1.5 var(--f-mono); color: var(--head); overflow-wrap: anywhere; user-select: all; }
+.invite .auth-link { padding: 4px 0; font-size: 13px; }
 .mail-note { margin: 0; font-size: 13px; color: var(--ink-2); text-align: center; }
 .mail-note:empty { display: none; }
 

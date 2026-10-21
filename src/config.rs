@@ -20,6 +20,9 @@ pub struct Config {
     /// The console's own origin (Railway domain), whose host is the passkey `rp.id`; without it
     /// the console pairing is off.
     pub node_origin: Option<String>,
+    /// Pairing code for the first console passkey, set by the provider (D-43, HNK-26.T20); valid
+    /// only while no passkey is paired.
+    pub setup_code: Option<String>,
     /// A name for the wallet account (test data starts with TES-).
     pub wallet_name: String,
 }
@@ -72,7 +75,12 @@ impl Config {
                 .map_err(|_| "BOARD_BIRTHDAY must be a block height")?,
             relay_url: var("RELAY_URL")
                 .unwrap_or_else(|| "https://relay-production-27dc.up.railway.app".into()),
-            node_origin: var("NODE_ORIGIN").map(|o| o.trim_end_matches('/').to_string()),
+            // On Railway the service's public domain gives the origin, so a managed node needs
+            // no setting (D-43); NODE_ORIGIN still wins.
+            node_origin: var("NODE_ORIGIN")
+                .or_else(|| var("RAILWAY_PUBLIC_DOMAIN").map(|d| format!("https://{d}")))
+                .map(|o| o.trim_end_matches('/').to_string()),
+            setup_code: var("SETUP_CODE"),
             wallet_name: var("WALLET_NAME").unwrap_or_else(|| "TES-financier-node".into()),
         })
     }

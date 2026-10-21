@@ -39,6 +39,18 @@
       <p class="mail-note" id="mail-note" role="status" aria-live="polite"></p>
     </section>
 
+    <section class="mail" id="devices" aria-labelledby="devices-title" hidden>
+      <div class="mail-head">
+        <h2 class="mail-title" id="devices-title">Devices</h2>
+        <button class="auth-link" id="add-device" type="button">Add a device</button>
+      </div>
+      <div class="invite" id="invite" hidden>
+        <p class="mail-note">Open this link on the new device within 15 minutes. It works once.</p>
+        <p class="invite-link is-mono" id="invite-link"></p>
+        <button class="auth-link" id="copy-invite" type="button">Copy link</button>
+      </div>
+    </section>
+
     <dl class="auth-facts">
       <dt>Network</dt><dd id="network">…</dd>
       <dt>Node key</dt><dd class="is-mono" id="fingerprint">…</dd>

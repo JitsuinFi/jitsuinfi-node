@@ -12,6 +12,14 @@ All in the data volume (`DATA_DIR`, `/data` on Railway), never in the repo, the 
 
 `jitsuin-node setup` makes what is missing (HNK-26.T1) and prints only public values; `serve` runs setup, registers the financier mailbox at the relay (HNK-26.T4), then serves `GET /node/health`, `GET /node/info` (financier key, mailbox id, wallet address, contact card) and the console. `jitsuin-node inbox` lists the messages in the mailbox.
 
+## Onboarding a financier, no terminal (HNK-26.T20, D-43)
+The node is managed by its provider; the financier only uses a browser and a passkey.
+1. The provider sets the Railway variable `SETUP_CODE` to a random code (16+ letters or digits, e.g. from a password generator) on the financier's node. `NODE_ORIGIN` comes from `RAILWAY_PUBLIC_DOMAIN` by itself.
+2. The provider sends the financier, through a private channel, the invite link `<origin>/console/pair#<SETUP_CODE>`. The part after `#` never reaches a server; the page fills the code in and removes it from the address bar.
+3. The financier opens the link, creates a passkey (fingerprint or face), and signs in at `<origin>/console/`.
+
+The setup code pairs the first passkey only; once a passkey is paired it is refused, and five wrong tries lock it for 15 minutes. More devices: **Add a device** in a signed-in console gives a one-time invite link (15 minutes). `jitsuin-node pair` (Railway: `railway ssh --service financier-node jitsuin-node pair`) stays for the provider's recovery only.
+
 ## Console pairing and sign-in (HNK-26.T2, T3)
 1. Set `NODE_ORIGIN` to the node's own HTTPS origin (the Railway domain); its host is the passkey `rp.id`.
 2. On the node, run `jitsuin-node pair` (Railway: `railway ssh --service financier-node jitsuin-node pair`). It prints a one-time code, valid for 15 minutes; only its hash is stored, never a log line.
@@ -34,7 +42,8 @@ A code is used up on its first correct try and dropped after five wrong ones. Th
 | `DATA_DIR` | `/data` (default) |
 | `ZCASH_DEVTOOL` | path of zcash-devtool (`/usr/local/bin/zcash-devtool` in the image) |
 | `RELAY_URL` | relay base URL (default: the Railway relay) |
-| `NODE_ORIGIN` | the console's origin, e.g. `https://financier-node-production.up.railway.app`; without it the console is off |
+| `NODE_ORIGIN` | the console's origin; defaults to `https://$RAILWAY_PUBLIC_DOMAIN` on Railway; without either the console is off |
+| `SETUP_CODE` | optional: the provider's code for the first console passkey (invite link `<origin>/console/pair#<code>`) |
 | `PORT` | set by Railway |
 
 ## Deploy
