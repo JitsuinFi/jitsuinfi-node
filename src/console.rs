@@ -341,7 +341,7 @@ impl Console {
         &self,
         ceremony: &str,
         credential: &RegisterPublicKeyCredential,
-    ) -> Result<usize, PairError> {
+    ) -> Result<(usize, String), PairError> {
         let (state, at) = self
             .ceremonies
             .lock()
@@ -363,18 +363,29 @@ impl Console {
         {
             return Err(PairError::Rejected);
         }
+        let cred = cred_hex(passkey.cred_id());
         stored.push(Stored {
             paired_at: now(),
             passkey,
             origin: Some(self.origin.clone()),
-            last_used: None,
+            last_used: Some(now()),
         });
         write_private(
             &self.credentials,
             &serde_json::to_vec(&stored).expect("json"),
         )
         .map_err(|_| PairError::Store)?;
-        Ok(stored.len())
+        // Registration required user verification on this device, so pairing also signs in: the
+        // financier lands in the console without a second prompt.
+        Ok((stored.len(), self.open_session(cred)))
+    }
+
+    fn open_session(&self, cred: String) -> String {
+        let token = random_hex::<32>();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, (end, _)| *end > Instant::now());
+        sessions.insert(token_hash(&token), (Instant::now() + SESSION_TTL, cred));
+        token
     }
 
     /// A one-time challenge for every paired credential.
@@ -411,11 +422,7 @@ impl Console {
             return Err(PairError::LoginGone);
         }
         let cred = self.verify_assertion(&state, credential)?;
-        let token = random_hex::<32>();
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.retain(|_, (end, _)| *end > Instant::now());
-        sessions.insert(token_hash(&token), (Instant::now() + SESSION_TTL, cred));
-        Ok(token)
+        Ok(self.open_session(cred))
     }
 
     /// True while `token` names an open session.
