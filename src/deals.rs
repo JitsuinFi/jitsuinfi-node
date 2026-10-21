@@ -59,6 +59,12 @@ pub struct Meta {
     pub seals: Vec<String>,
     #[serde(default)]
     pub bundle_sent: bool,
+    /// HNK-26.T14: when the board shows the invoice financed twice, the double-signature proof
+    /// (JTSP) and Exhibit A (JTSX), base64url, for the Verify page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhibit: Option<String>,
     /// HNK-26.T8: the buyer's history was asked for; its tag and what the check found.
     #[serde(default)]
     pub history_requested: bool,
@@ -303,6 +309,23 @@ pub fn with_history_tag(flow: &Flow, tag: [u8; 32]) -> Result<Flow, String> {
     let mut deal = flow.deal().clone();
     deal.history_tag = Some(tag);
     Flow::new(deal).map_err(|e| e.to_string())
+}
+
+/// HNK-26.T14: the double-signature proof and Exhibit A of a deal stopped as double financed,
+/// both checked before they are kept; `None` in any other state.
+pub fn double_proof(
+    flow: &Flow,
+    buyer_signature: &str,
+) -> Result<Option<(String, String)>, String> {
+    let sig = unhex::<64>(buyer_signature)?;
+    let Some(p) = flow.double_sign_proof(sig).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let x = jitsuin_core::Exhibit::from_proof(&p).map_err(|e| e.to_string())?;
+    Ok(Some((
+        URL_SAFE_NO_PAD.encode(p.to_bytes().map_err(|e| e.to_string())?),
+        URL_SAFE_NO_PAD.encode(x.to_bytes().map_err(|e| e.to_string())?),
+    )))
 }
 
 /// The supplier's signed board entry from a `deal.entry` for N.
@@ -593,6 +616,35 @@ mod tests {
         let back = jitsuin_core::Bundle::from_bytes(&b).unwrap();
         assert_eq!(back.assignment_seals.len(), 3);
         assert!(bundle(&f, &a.buyer_signature, &kept[..1], &fin).is_err());
+
+        // HNK-26.T14: the supplier signed the invoice for two other financiers: proof and exhibit
+        use jitsuin_board::{BoardRecord, Position};
+        use jitsuin_core::EntryKind;
+        let n32 = unhex::<32>(&n).unwrap();
+        let rec = |txid: &str, h: u32, c: u8| BoardRecord {
+            txid: txid.into(),
+            position: Position {
+                height: h,
+                tx_index: 1,
+                output_index: 0,
+            },
+            entry: BoardEntry::sign(&supplier, EntryKind::Register, n32, [c; 32], 0, 0),
+        };
+        let records = vec![
+            rec(&"aa".repeat(32), 10, 0x11),
+            rec(&"bb".repeat(32), 11, 0x22),
+        ];
+        let lookup = jitsuin_board::lookup(&records, &n32, &supplier.verifying_key().to_bytes());
+        let mut stopped = f.clone();
+        stopped
+            .apply(jitsuin_flow::financier::Event::BoardChecked {
+                lookup,
+                tip_height: 20,
+            })
+            .unwrap();
+        let (proof, exhibit) = double_proof(&stopped, &a.buyer_signature).unwrap().unwrap();
+        assert!(!proof.is_empty() && !exhibit.is_empty());
+        assert!(double_proof(&f, &a.buyer_signature).unwrap().is_none());
     }
 
     #[test]
