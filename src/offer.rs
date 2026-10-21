@@ -32,6 +32,8 @@ pub struct Offer {
     pub supplier_address: String,
     /// The supplier's reply mailbox, from the signed header.
     pub supplier_mailbox_pk: [u8; 32],
+    /// The buyer's mailbox, when the supplier gave it: the letter goes there too (HNK-26.T16).
+    pub buyer_mailbox_pk: Option<[u8; 32]>,
 }
 
 /// The terms the operator accepted, saved before the reply is sent.
@@ -44,6 +46,8 @@ pub struct Accepted {
     pub min_confirmations: u32,
     pub supplier_address: String,
     pub supplier_mailbox_pk: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_mailbox_pk: Option<String>,
     pub discount: u8,
     pub tenor: u8,
     /// Seconds since the Unix epoch.
@@ -99,7 +103,14 @@ pub fn read(header: &Value) -> Result<Offer, String> {
     if !address_ok(supplier_address) {
         return Err("the supplier's address is not a shielded address".into());
     }
+    let buyer_mailbox_pk = match body["buyer_mailbox_pk"].as_str() {
+        None => None,
+        Some(s) => {
+            Some(unhex::<32>(s).map_err(|_| "the buyer's mailbox is not 64 hex characters")?)
+        }
+    };
     Ok(Offer {
+        buyer_mailbox_pk,
         n,
         invoice_b64: invoice_b64.to_string(),
         invoice,
@@ -175,6 +186,7 @@ pub fn accept(
         min_confirmations,
         supplier_address: o.supplier_address.clone(),
         supplier_mailbox_pk: hex(&o.supplier_mailbox_pk),
+        buyer_mailbox_pk: o.buyer_mailbox_pk.map(|b| hex(&b)),
         discount,
         tenor,
         accepted_at: now,
