@@ -198,6 +198,42 @@ fn directory_cli(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// `provider reputation <relay_id> <board.json>` (HNK-30.T21, D-48): checks a node's
+/// `financier.reputation_request` against the board and writes the classes into its listing.
+async fn reputation_cli(args: &[String]) -> Result<(), String> {
+    let (Some(id), Some(board)) = (args.get(1), args.get(2)) else {
+        return Err("usage: jitsuin-node provider reputation <relay_id> <board.json>  (requests: provider listings)".into());
+    };
+    let p = load(false)?;
+    let r = relay()?;
+    let (got, _, token) = r.receive(&p.mailbox).await.map_err(|e| e.to_string())?;
+    let m = got
+        .iter()
+        .find(|m| &m.relay_id == id)
+        .ok_or("no message with that id")?;
+    let (pk, deals) = crate::reputation::read_request(&m.message.header)?;
+    let board_json = fs::read_to_string(board).map_err(|e| format!("{board}: {e}"))?;
+    let (settled, on_time, top) = crate::reputation::count(&board_json, &pk, &deals)?;
+    println!("{} deal(s) sent, {settled} registered for this key and settled, {on_time} on time (board up to {top})", deals.len());
+    let path = dir().join("directory.json");
+    let mut list: Vec<directory::Listing> = fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let l = list
+        .iter_mut()
+        .find(|l| l.financier_pk == hex(&pk))
+        .ok_or("this financier is not in the directory yet: accept its listing first")?;
+    l.reputation = crate::reputation::classes(settled, on_time, top, now());
+    println!("reputation: {:?}", l.reputation);
+    fs::write(&path, serde_json::to_vec_pretty(&list).unwrap()).map_err(|e| e.to_string())?;
+    r.remove(&p.mailbox, id, &token)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("saved; run `provider directory publish` to publish");
+    Ok(())
+}
+
 /// The `financier.listing` messages in the provider mailbox (HNK-30.T19).
 async fn listings_cli(args: &[String]) -> Result<(), String> {
     let p = load(false)?;
@@ -317,6 +353,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         }
         Some("directory") => directory_cli(&args[1..]),
         Some("listings") | Some("accept") => listings_cli(args).await,
+        Some("reputation") => reputation_cli(args).await,
         _ => Err("usage: jitsuin-node provider init | inbox | invite <reply_mailbox_pk> <link> | remove <relay_id> | directory …".into()),
     }
 }

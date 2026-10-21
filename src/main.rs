@@ -16,6 +16,7 @@ mod offer;
 mod pay;
 mod provider;
 mod relay;
+mod reputation;
 mod setup;
 
 use std::sync::Arc;
@@ -529,6 +530,53 @@ async fn mandate_set(
     Json(json!({ "ok": true, "mandate": mandate })).into_response()
 }
 
+/// Asks the provider to attest this financier's record (HNK-30.T21, D-48): the node sends the
+/// `(N, salt)` of every deal it accepted, sealed and signed with the financier key.
+async fn reputation_request(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let ns: Vec<[u8; 32]> = std::fs::read_dir(st.data_dir.join(DEALS_DIR))
+        .map(|d| {
+            d.filter_map(|e| {
+                e.ok()?
+                    .file_name()
+                    .to_str()?
+                    .strip_suffix(".json")
+                    .map(String::from)
+            })
+            .filter_map(|n| message::unhex::<32>(&n).ok())
+            .collect()
+        })
+        .unwrap_or_default();
+    if ns.is_empty() {
+        return error(
+            StatusCode::CONFLICT,
+            "no deals yet: a record starts with the first accepted offer",
+        );
+    }
+    let (Ok(me), Ok(to)) = (
+        message::unhex::<32>(&st.public.mailbox_pk),
+        directory::provider_mailbox(),
+    ) else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the node has no mailbox key",
+        );
+    };
+    let bytes = match reputation::request_message(&st.financier, &me, &to, &ns, unix_now()) {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    match st.mail.send(&to, &bytes).await {
+        Ok(_) => Json(json!({ "ok": true, "deals": ns.len() })).into_response(),
+        Err(e) => error(
+            StatusCode::BAD_GATEWAY,
+            &format!("the request did not reach the provider: {e}"),
+        ),
+    }
+}
+
 const DEALS_DIR: &str = "deals";
 
 fn unix_now() -> u64 {
@@ -843,6 +891,7 @@ fn app(st: State) -> Router {
         .route("/node/console/offers/{id}/accept", post(offer_accept))
         .route("/node/console/buyers", get(buyers_list).post(buyers_add))
         .route("/node/console/mandate", get(mandate_get).post(mandate_set))
+        .route("/node/console/reputation", post(reputation_request))
         .route("/node/console/buyers/{pk}", delete(buyers_remove))
         .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
         .route("/console/", get(|| console_file(Path(String::new()))))
