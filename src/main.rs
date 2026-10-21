@@ -11,6 +11,7 @@ mod keys;
 mod mail;
 mod message;
 mod pay;
+mod provider;
 mod relay;
 mod setup;
 
@@ -618,6 +619,14 @@ async fn register_mailbox(relay_url: String, me: jitsuin_core::mailbox::MailboxK
 #[tokio::main]
 async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
+    // The provider's commands run on the provider's machine and need no node settings.
+    if cmd == "provider" {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = provider::run(&args).await {
+            fail(e);
+        }
+        return;
+    }
     let cfg = match config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {
