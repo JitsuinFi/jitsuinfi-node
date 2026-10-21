@@ -23,6 +23,8 @@ pub struct Config {
     /// Pairing code for the first console passkey, set by the provider (D-43, HNK-26.T20); valid
     /// only while no passkey is paired.
     pub setup_code: Option<String>,
+    /// Display name of the financier, set by the provider (shown only in its own console).
+    pub financier_name: Option<String>,
     /// A name for the wallet account (test data starts with TES-).
     pub wallet_name: String,
 }
@@ -81,6 +83,7 @@ impl Config {
                 .or_else(|| var("RAILWAY_PUBLIC_DOMAIN").map(|d| format!("https://{d}")))
                 .map(|o| o.trim_end_matches('/').to_string()),
             setup_code: var("SETUP_CODE"),
+            financier_name: var("FINANCIER_NAME").map(|n| n.chars().take(60).collect()),
             wallet_name: var("WALLET_NAME").unwrap_or_else(|| "TES-financier-node".into()),
         })
     }

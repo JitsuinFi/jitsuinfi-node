@@ -99,6 +99,8 @@ struct State {
     mail: Arc<mail::Mail>,
     board: Arc<board::Board>,
     data_dir: std::path::PathBuf,
+    /// The financier's display name (FINANCIER_NAME), shown only in its own console.
+    name: Option<String>,
 }
 
 impl State {
@@ -324,7 +326,8 @@ async fn pair_start(
     };
     match c.start(code) {
         Ok((ceremony, options)) => {
-            Json(json!({ "ceremony": ceremony, "options": options })).into_response()
+            Json(json!({ "ceremony": ceremony, "options": options, "name": st.name }))
+                .into_response()
         }
         Err(e) => error(pair_status(&e), e.message()),
     }
@@ -346,9 +349,16 @@ async fn pair_finish(
         return error(StatusCode::BAD_REQUEST, "ceremony or credential is missing");
     };
     match c.finish(ceremony, &credential) {
-        Ok(n) => {
+        Ok((n, token)) => {
             println!("console: passkey paired ({n} kept)");
-            Json(json!({ "ok": true, "credentials": n })).into_response()
+            (
+                [(
+                    header::SET_COOKIE,
+                    session_cookie(&token, console::SESSION_TTL.as_secs()),
+                )],
+                Json(json!({ "ok": true, "credentials": n, "name": st.name })),
+            )
+                .into_response()
         }
         Err(e) => error(pair_status(&e), e.message()),
     }
@@ -420,7 +430,9 @@ async fn session(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
         .zip(session_token(&headers))
         .is_some_and(|(c, t)| c.session(t));
     let paired = st.console.as_ref().is_some_and(|c| !c.stored().is_empty());
-    Json(json!({ "signed_in": open, "paired": paired, "console": st.console.is_some() }))
+    // The financier's name only to its own session: /node/console/session is public.
+    let name = if open { st.name.clone() } else { None };
+    Json(json!({ "signed_in": open, "paired": paired, "console": st.console.is_some(), "name": name }))
         .into_response()
 }
 
@@ -639,6 +651,7 @@ async fn main() {
             let st = State {
                 board,
                 data_dir: cfg.data_dir.clone(),
+                name: cfg.financier_name.clone(),
                 public: Arc::new(p),
                 console,
                 origin: cfg.node_origin.clone(),
