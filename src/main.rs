@@ -122,6 +122,8 @@ struct State {
     plans: Arc<std::sync::Mutex<std::collections::HashMap<String, fund::Plan>>>,
     /// The watch-only board wallet and the server, for the deal flow (HNK-26.T16).
     board_watch: Arc<jitsuin_wallet::Devtool>,
+    /// The zcash-devtool binary, for commands the wallet crate does not wrap (new addresses).
+    devtool: std::path::PathBuf,
     lightwalletd: String,
     /// The board's address, where the node posts register entries (`BOARD_ADDRESS`, else the
     /// board wallet's default address).
@@ -1534,11 +1536,27 @@ async fn offer_accept(
     match sent {
         Ok(_) => {
             // HNK-26.T16: the deal's flow and its letter start now; the driver moves it on.
+            // HNK-26.T17: the letter names a fresh address of this wallet for this deal only
+            let (bin, dir, b) = (
+                st.devtool.clone(),
+                st.wallet.wallet_dir().to_path_buf(),
+                st.board.clone(),
+            );
+            let address = tokio::task::spawn_blocking(move || {
+                let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+                deals::new_address(&bin, &dir)
+            })
+            .await
+            .expect("wallet task")
+            .unwrap_or_else(|e| {
+                eprintln!("deal: {e}; the letter names the wallet's default address");
+                st.public.wallet_address.clone()
+            });
             let started = deals::start(
                 &deals,
                 &a,
                 &st.financier,
-                &st.public.wallet_address,
+                &address,
                 &st.name().unwrap_or_default(),
             );
             let st2 = st.clone();
@@ -1959,6 +1977,7 @@ async fn main() {
                 fund: Arc::default(),
                 plans: Arc::default(),
                 board_watch: Arc::new(node.board_watch.clone()),
+                devtool: cfg.devtool.clone(),
                 lightwalletd: cfg.lightwalletd.clone(),
                 board_address: Arc::new(std::sync::RwLock::new(
                     std::env::var("BOARD_ADDRESS")
