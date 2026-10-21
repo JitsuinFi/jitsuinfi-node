@@ -1387,6 +1387,17 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
             break;
         }
     }
+    // HNK-26.T14: another financier registered this invoice first: keep the evidence
+    if meta.proof.is_none() {
+        match deals::double_proof(&flow, &accepted.buyer_signature) {
+            Ok(Some((p, x))) => {
+                meta.proof = Some(p);
+                meta.exhibit = Some(x);
+            }
+            Ok(None) => {}
+            Err(e) => meta.problem = Some(format!("the double-financing proof failed: {e}")),
+        }
+    }
     deals::save_flow(&dir, n, &flow)?;
     let _ = deals::save_meta(&dir, n, &meta);
     Ok(deal_view(&flow, &meta))
@@ -1405,6 +1416,8 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["settled_txid"] = meta.settled_txid.clone().into();
     v["bundle_sent"] = meta.bundle_sent.into();
     v["history_requested"] = meta.history_requested.into();
+    v["proof"] = meta.proof.clone().into();
+    v["exhibit"] = meta.exhibit.clone().into();
     v["history"] = meta.history.clone().into();
     v["problem"] = meta.problem.clone().into();
     if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
