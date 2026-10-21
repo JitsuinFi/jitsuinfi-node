@@ -10,6 +10,7 @@ mod console;
 mod keys;
 mod mail;
 mod message;
+mod offer;
 mod pay;
 mod provider;
 mod relay;
@@ -103,6 +104,8 @@ struct State {
     /// The financier's display name, shown only in its own console: what the financier saved
     /// (`financier-name.txt` in the volume), else FINANCIER_NAME from the provider.
     name: Arc<std::sync::RwLock<Option<String>>>,
+    /// Signs the node's replies in a deal (commitment opening, letter, advance).
+    financier: Arc<ed25519_dalek::SigningKey>,
 }
 
 impl State {
@@ -294,7 +297,14 @@ async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
         return error(status, msg);
     }
     match st.mail.list().await {
-        Ok((messages, refused)) => {
+        Ok((mut messages, refused)) => {
+            // Offers are checked here, with the node's keys, not in the console (HNK-26.T5).
+            let deals = st.data_dir.join(DEALS_DIR);
+            for m in messages.iter_mut().filter(|m| m["type"] == "deal.offer") {
+                if let Some(h) = m["relay_id"].as_str().and_then(|id| st.mail.header(id)) {
+                    m["offer"] = offer::summary(&h, &deals);
+                }
+            }
             Json(json!({ "messages": messages, "refused": refused })).into_response()
         }
         Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
@@ -349,6 +359,106 @@ async fn mail_remove(
             "list the mailbox again; this message is not in it",
         ),
         Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    }
+}
+
+const DEALS_DIR: &str = "deals";
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The operator accepts an offer from the mailbox with its own advance and confirmations: the
+/// node checks the offer again, saves the terms once per invoice, and sends the supplier the
+/// commitment opening (HNK-26.T5, SEQ-03 part 1 and 2).
+async fn offer_accept(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    if st.console.as_ref().is_some_and(|c| c.demo) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this is the demo console: that is turned off here",
+        );
+    }
+    let Some(h) = st.mail.header(&id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "list the mailbox again; this offer is not in it",
+        );
+    };
+    let o = match offer::read(&h) {
+        Ok(o) => o,
+        Err(problem) => return error(StatusCode::UNPROCESSABLE_ENTITY, &problem),
+    };
+    let (Some(advance), Some(confirmations)) = (
+        body["advance_zat"].as_u64(),
+        body["min_confirmations"]
+            .as_u64()
+            .and_then(|c| u32::try_from(c).ok()),
+    ) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "give the advance and the confirmations",
+        );
+    };
+    let now = unix_now();
+    let deals = st.data_dir.join(DEALS_DIR);
+    let a = match offer::accept(
+        &deals,
+        &o,
+        advance,
+        confirmations,
+        (now / 86_400) as u32,
+        now,
+    ) {
+        Ok(a) => a,
+        Err(offer::AcceptError::Terms(msg)) => return error(StatusCode::BAD_REQUEST, msg),
+        Err(offer::AcceptError::Taken) => {
+            return error(
+                StatusCode::CONFLICT,
+                "this invoice was accepted already: one deal per invoice",
+            )
+        }
+        Err(offer::AcceptError::Io(_)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the node could not save the deal",
+            )
+        }
+    };
+    let mailbox_pk = match message::unhex::<32>(&st.public.mailbox_pk) {
+        Ok(pk) => pk,
+        Err(_) => {
+            offer::forget(&deals, &a.n);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the node has no mailbox key",
+            );
+        }
+    };
+    let sent = match offer::opening_message(&st.financier, &mailbox_pk, &a, now) {
+        Ok((bytes, to)) => st.mail.send(&to, &bytes).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match sent {
+        Ok(_) => Json(json!({ "ok": true, "deal": a })).into_response(),
+        Err(e) => {
+            // Nothing reached the supplier: forget the terms so the operator can try again.
+            offer::forget(&deals, &a.n);
+            error(
+                StatusCode::BAD_GATEWAY,
+                &format!("the reply did not reach the supplier: {e}"),
+            )
+        }
     }
 }
 
@@ -563,6 +673,7 @@ fn app(st: State) -> Router {
         .route("/node/board", get(board_snapshot))
         .route("/node/mail", get(mail_list))
         .route("/node/mail/{id}", delete(mail_remove))
+        .route("/node/console/offers/{id}/accept", post(offer_accept))
         .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
         .route("/console/", get(|| console_file(Path(String::new()))))
         .route(
@@ -728,6 +839,7 @@ async fn main() {
                 console,
                 origin: cfg.node_origin.clone(),
                 mail: Arc::new(mail::Mail::new(relay, node.keys.mailbox())),
+                financier: Arc::new(node.keys.financier()),
             };
             axum::serve(listener, app(st))
                 .with_graceful_shutdown(async {

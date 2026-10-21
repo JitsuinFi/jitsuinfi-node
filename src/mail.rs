@@ -72,6 +72,17 @@ impl Mail {
         Some((name, bytes))
     }
 
+    /// The header of a listed message.
+    pub fn header(&self, relay_id: &str) -> Option<serde_json::Value> {
+        let seen = self.seen.lock().unwrap();
+        Some(seen.get(relay_id)?.message.header.clone())
+    }
+
+    /// Seals an encoded message to `to_pk` at the relay.
+    pub async fn send(&self, to_pk: &[u8; 32], plaintext: &[u8]) -> Result<String, RelayError> {
+        self.relay.send(to_pk, plaintext).await
+    }
+
     /// Removes a listed message from the relay.
     pub async fn remove(&self, relay_id: &str) -> Result<bool, RelayError> {
         if !self.seen.lock().unwrap().contains_key(relay_id) {
