@@ -12,6 +12,7 @@ mod directory;
 mod fund;
 mod keys;
 mod mail;
+mod mandate;
 mod message;
 mod offer;
 mod pay;
@@ -323,12 +324,38 @@ async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
         Ok((mut messages, refused)) => {
             // Offers are checked here, with the node's keys, not in the console (HNK-26.T5).
             let deals = st.data_dir.join(DEALS_DIR);
+            // HNK-30.T11: what the mailbox says about each N's buyer, for the private mandate
+            let mut buyers: std::collections::HashMap<String, mandate::Buyer> = Default::default();
+            for m in &messages {
+                let Some(h) = m["relay_id"].as_str().and_then(|id| st.mail.header(id)) else {
+                    continue;
+                };
+                if let (true, Some(n)) = (h["type"] == "history.chain", h["n"].as_str()) {
+                    let b = buyers.entry(n.to_string()).or_default();
+                    let k = h["body"]["certs"].as_array().map_or(0, |c| c.len() as u32);
+                    b.history = Some(b.history.unwrap_or(0).max(k));
+                    b.registered |= st.buyers.flag(&h)["registered"] == true;
+                }
+            }
+            let private = mandate::PrivateMandate::load(&st.data_dir);
+            let today = (unix_now() / 86_400) as u32;
             for m in messages.iter_mut() {
                 let Some(h) = m["relay_id"].as_str().and_then(|id| st.mail.header(id)) else {
                     continue;
                 };
                 if h["type"] == "deal.offer" {
-                    m["offer"] = offer::summary(&h, &deals);
+                    let mut o = offer::summary(&h, &deals);
+                    if o["ok"] == true {
+                        let b = o["n"]
+                            .as_str()
+                            .and_then(|n| buyers.get(n))
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut v = mandate::verdict(&private, &o, &b, today);
+                        v["decline_reason"] = mandate::decline_reason(&v).into();
+                        o["mandate"] = v;
+                    }
+                    m["offer"] = o;
                 }
                 // A buyer history from an identity key the financier did not register is flagged.
                 if h["type"] == "history.chain" {
@@ -922,6 +949,109 @@ async fn fund_close(
     .into_response()
 }
 
+/// The private mandate (HNK-30.T11): kept on this node only, never sent anywhere.
+async fn private_get(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    Json(json!({ "mandate": mandate::PrivateMandate::load(&st.data_dir) })).into_response()
+}
+
+async fn private_set(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let m = match serde_json::from_value::<mandate::PrivateMandate>(body) {
+        Ok(m) => m,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "these are not mandate rules"),
+    };
+    if let Err(msg) = m.check() {
+        return error(StatusCode::BAD_REQUEST, msg);
+    }
+    match m.save(&st.data_dir) {
+        Ok(()) => Json(json!({ "ok": true, "mandate": m })).into_response(),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the node could not save the mandate",
+        ),
+    }
+}
+
+/// Declines an offer (HNK-26.T6): a signed `deal.decline` to the supplier, naming only which kind
+/// of rule it breaks, then the offer leaves the mailbox. An accepted offer cannot be declined.
+async fn offer_decline(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let Some(h) = st.mail.header(&id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "list the mailbox again; this offer is not in it",
+        );
+    };
+    let o = match offer::read(&h) {
+        Ok(o) => o,
+        Err(problem) => return error(StatusCode::UNPROCESSABLE_ENTITY, &problem),
+    };
+    if offer::load(&st.data_dir.join(DEALS_DIR), &o.n).is_some() {
+        return error(
+            StatusCode::CONFLICT,
+            "this offer was accepted: it cannot be declined",
+        );
+    }
+    let reason: String = body["reason"]
+        .as_str()
+        .unwrap_or("The financier declined this offer.")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let reason = match reason.trim() {
+        "" => "The financier declined this offer.".to_string(),
+        r => r.to_string(),
+    };
+    let (Ok(me), Some(Ok(to))) = (
+        message::unhex::<32>(&st.public.mailbox_pk),
+        h["from"]["mailbox_pk"].as_str().map(message::unhex::<32>),
+    ) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the offer has no reply mailbox",
+        );
+    };
+    let mut d = message::draft(
+        "deal.decline",
+        &me,
+        &to,
+        Some(&o.n),
+        json!({ "reason": reason }),
+        &[],
+        unix_now(),
+    );
+    message::sign(&mut d, &st.financier);
+    let bytes = match message::encode(&d, &[]) {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    if let Err(e) = st.mail.send(&to, &bytes).await {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            &format!("the decline did not reach the supplier: {e}"),
+        );
+    }
+    let _ = st.mail.remove(&id).await;
+    Json(json!({ "ok": true, "reason": reason })).into_response()
+}
+
 const DEALS_DIR: &str = "deals";
 
 fn unix_now() -> u64 {
@@ -1234,6 +1364,11 @@ fn app(st: State) -> Router {
         .route("/node/mail", get(mail_list))
         .route("/node/mail/{id}", delete(mail_remove))
         .route("/node/console/offers/{id}/accept", post(offer_accept))
+        .route("/node/console/offers/{id}/decline", post(offer_decline))
+        .route(
+            "/node/console/mandate/private",
+            get(private_get).post(private_set),
+        )
         .route("/node/console/buyers", get(buyers_list).post(buyers_add))
         .route("/node/console/mandate", get(mandate_get).post(mandate_set))
         .route("/node/console/reputation", post(reputation_request))
