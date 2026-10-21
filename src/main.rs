@@ -1015,6 +1015,10 @@ async fn offer_decline(
         .filter(|c| !c.is_control())
         .take(200)
         .collect();
+    let reason = match reason.trim() {
+        "" => "The financier declined this offer.".to_string(),
+        r => r.to_string(),
+    };
     let (Ok(me), Some(Ok(to))) = (
         message::unhex::<32>(&st.public.mailbox_pk),
         h["from"]["mailbox_pk"].as_str().map(message::unhex::<32>),
@@ -1029,7 +1033,7 @@ async fn offer_decline(
         &me,
         &to,
         Some(&o.n),
-        json!({ "reason": reason.trim() }),
+        json!({ "reason": reason }),
         &[],
         unix_now(),
     );
@@ -1045,7 +1049,7 @@ async fn offer_decline(
         );
     }
     let _ = st.mail.remove(&id).await;
-    Json(json!({ "ok": true, "reason": reason.trim() })).into_response()
+    Json(json!({ "ok": true, "reason": reason })).into_response()
 }
 
 const DEALS_DIR: &str = "deals";
