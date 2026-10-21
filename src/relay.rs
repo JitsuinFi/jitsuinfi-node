@@ -129,7 +129,6 @@ impl Relay {
         Ok(())
     }
 
-    #[allow(dead_code)] // the deal API sends (HNK-26.T5+)
     /// Seals an encoded message to `to_pk` and drops it in that mailbox; returns the relay's id.
     pub async fn send(&self, to_pk: &[u8; 32], plaintext: &[u8]) -> Result<String> {
         let mut eph = [0u8; 32];
