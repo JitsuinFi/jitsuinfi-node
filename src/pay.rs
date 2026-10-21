@@ -58,7 +58,6 @@ impl std::fmt::Display for PayError {
 
 /// Pays the advance of `flow` only when `approval` approves exactly this payment; the approval is
 /// used up first, so a failed payment needs a new approval.
-#[allow(dead_code)] // called by the deal API (HNK-26.T5+), the only path to an advance
 pub fn advance(
     console: &Console,
     approval: &str,

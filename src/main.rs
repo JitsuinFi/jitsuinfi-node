@@ -8,6 +8,7 @@ mod board;
 mod buyers;
 mod config;
 mod console;
+mod deals;
 mod directory;
 mod fund;
 mod keys;
@@ -119,6 +120,14 @@ struct State {
     fund: Arc<tokio::sync::Mutex<()>>,
     /// Close plans waiting for their passkey approval, by id.
     plans: Arc<std::sync::Mutex<std::collections::HashMap<String, fund::Plan>>>,
+    /// The watch-only board wallet and the server, for the deal flow (HNK-26.T16).
+    board_watch: Arc<jitsuin_wallet::Devtool>,
+    lightwalletd: String,
+    /// The board's address, where the node posts register entries (`BOARD_ADDRESS`, else the
+    /// board wallet's default address).
+    board_address: Arc<std::sync::RwLock<Option<String>>>,
+    /// One deal step at a time.
+    deal_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl State {
@@ -631,8 +640,9 @@ fn fund_error(e: impl std::fmt::Display) -> Response {
 
 /// The wallet's transactions and balance, after a sync (zcash-devtool blocks: off the runtime).
 async fn wallet_state(st: &State) -> Result<(Vec<jitsuin_wallet::WalletTx>, u64), String> {
-    let w = st.wallet.clone();
+    let (w, b) = (st.wallet.clone(), st.board.clone());
     tokio::task::spawn_blocking(move || {
+        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
         w.sync()?;
         w.enhance()?;
         Ok::<_, jitsuin_wallet::Error>((w.list_tx()?, w.balance_zat()?))
@@ -840,9 +850,13 @@ async fn fund_close(
                 memo: None,
             })
             .collect();
-        match tokio::task::spawn_blocking(move || w.pay(&payments))
-            .await
-            .expect("wallet task")
+        let b = st.board.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+            w.pay(&payments)
+        })
+        .await
+        .expect("wallet task")
         {
             Ok(t) => Some(t),
             Err(e) => {
@@ -881,7 +895,9 @@ async fn fund_close(
     let key = st.financier.clone();
     let w = st.wallet.clone();
     let period = plan.period;
+    let b = st.board.clone();
     let root_txid = tokio::task::spawn_blocking(move || {
+        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
         let r = jitsuin_core::LiabilityRoot::sign(&key, period, root, total);
         let memo = jitsuin_core::memo::encode(&[jitsuin_core::MemoItem::Root(r)])
             .map_err(|e| e.to_string())?;
@@ -1052,6 +1068,305 @@ async fn offer_decline(
     Json(json!({ "ok": true, "reason": reason })).into_response()
 }
 
+/// The financier as `jitsuin_flow` needs it: wallets, board address, server, key.
+async fn financier(st: &State) -> Result<jitsuin_flow::financier::Financier, String> {
+    let known = st.board_address.read().unwrap().clone();
+    let board_address = match known {
+        Some(a) => a,
+        None => {
+            let (w, b) = (st.board_watch.clone(), st.board.clone());
+            let a = tokio::task::spawn_blocking(move || {
+                let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+                w.default_address()
+            })
+            .await
+            .expect("wallet task")
+            .map_err(|e| format!("the board address is not known: {e}"))?;
+            *st.board_address.write().unwrap() = Some(a.clone());
+            a
+        }
+    };
+    Ok(jitsuin_flow::financier::Financier {
+        wallet: (*st.wallet).clone(),
+        board_watch: (*st.board_watch).clone(),
+        board_address,
+        lightwalletd: st.lightwalletd.clone(),
+        key: (*st.financier).clone(),
+    })
+}
+
+/// Messages in the mailbox for deal `n` of type `kind`: (relay id, header).
+async fn mail_for(st: &State, n: &str, kind: &str) -> Vec<(String, Value)> {
+    let Ok((list, _)) = st.mail.list().await else {
+        return vec![];
+    };
+    list.iter()
+        .filter_map(|m| {
+            let id = m["relay_id"].as_str()?;
+            let h = st.mail.header(id)?;
+            (h["type"] == kind && h["n"].as_str() == Some(n)).then(|| (id.to_string(), h))
+        })
+        .collect()
+}
+
+/// Moves deal `n` as far as it can go without the operator: board checks from the latest scan,
+/// the supplier's entry, posting it, the letter, the seals, the advance's confirmation. Returns
+/// the deal's view. Paying the advance is not here: it needs a passkey (`deal_pay`).
+async fn drive(st: &State, n: &str) -> Result<Value, String> {
+    use jitsuin_flow::financier::{Event, State as S};
+    let _g = st.deal_lock.lock().await;
+    let dir = st.data_dir.join(DEALS_DIR);
+    let mut flow = deals::load_flow(&dir, n).ok_or("no deal with this N")?;
+    let mut meta = deals::load_meta(&dir, n);
+    let me = message::unhex::<32>(&st.public.mailbox_pk)?;
+    let accepted = offer::load(&dir, n).ok_or("the deal's terms are gone")?;
+    meta.problem = None;
+    for _ in 0..6 {
+        let before = flow.state().name();
+        let step: Result<(), String> = async {
+            match flow.state().clone() {
+                S::Check | S::AwaitConfirmation { .. } => {
+                    let (records, tip) = st
+                        .board
+                        .records()
+                        .ok_or("waiting for the first board scan")?;
+                    let lookup = jitsuin_board::lookup(
+                        &records,
+                        flow.nullifier(),
+                        &flow.deal().invoice.supplier_ephemeral_pk,
+                    );
+                    flow.apply(Event::BoardChecked {
+                        lookup,
+                        tip_height: tip,
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
+                S::AwaitSupplierSignature => {
+                    for (_, h) in mail_for(st, n, "deal.entry").await {
+                        let Ok(entry) = deals::read_entry(&h, n) else {
+                            continue;
+                        };
+                        if flow.apply(Event::SupplierSigned(entry)).is_ok() {
+                            break;
+                        }
+                    }
+                }
+                S::Register { .. } => {
+                    let fin = financier(st).await?;
+                    let b = st.board.clone();
+                    let mut f = flow.clone();
+                    flow = tokio::task::spawn_blocking(move || {
+                        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+                        fin.register(&mut f)?;
+                        Ok::<_, jitsuin_flow::Error>(f)
+                    })
+                    .await
+                    .expect("wallet task")
+                    .map_err(|e| format!("posting the entry failed: {e}"))?;
+                }
+                S::AwaitAssignment { .. } => {
+                    if !meta.letter_sent {
+                        let pdf =
+                            std::fs::read(deals::pdf_path(&dir, n)).map_err(|e| e.to_string())?;
+                        let mut to = vec![message::unhex::<32>(&accepted.supplier_mailbox_pk)?];
+                        if let Some(b) = &accepted.buyer_mailbox_pk {
+                            to.push(message::unhex::<32>(b)?);
+                        }
+                        for t in to {
+                            let bytes = deals::letter_message(
+                                &st.financier,
+                                &me,
+                                &t,
+                                &flow,
+                                &pdf,
+                                unix_now(),
+                            )?;
+                            st.mail
+                                .send(&t, &bytes)
+                                .await
+                                .map_err(|e| format!("the letter did not go out: {e}"))?;
+                        }
+                        meta.letter_sent = true;
+                    }
+                    let mut seals: [Option<jitsuin_core::Seal>; 2] = [None, None];
+                    for (_, h) in mail_for(st, n, "deal.seal").await {
+                        if let Ok((i @ 0..=1, s)) = deals::read_seal(&h, n) {
+                            seals[i as usize] = Some(s);
+                        }
+                    }
+                    if let [Some(s0), Some(s1)] = seals {
+                        flow.apply(Event::AssignmentSealed(vec![s0, s1]))
+                            .map_err(|e| format!("the seals do not hold: {e}"))?;
+                    }
+                }
+                S::AwaitAdvanceConfirmation { advance_txid, .. } => {
+                    let (w, b, l) = (st.wallet.clone(), st.board.clone(), st.lightwalletd.clone());
+                    let txid = advance_txid.clone();
+                    let (mined, tip) = tokio::task::spawn_blocking(move || {
+                        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+                        w.sync().map_err(|e| e.to_string())?;
+                        let mined = w
+                            .list_tx()
+                            .map_err(|e| e.to_string())?
+                            .iter()
+                            .any(|t| t.txid == txid && t.mined_height.is_some());
+                        let tip =
+                            jitsuin_board::lwd::latest_height(&l).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((mined, tip))
+                    })
+                    .await
+                    .expect("wallet task")?;
+                    flow.apply(Event::AdvanceChecked {
+                        mined,
+                        tip_height: tip,
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
+                S::Pay { .. } | S::Done { .. } | S::Stopped(_) => {}
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = step {
+            meta.problem = Some(e);
+            break;
+        }
+        if flow.state().name() == before {
+            break;
+        }
+    }
+    deals::save_flow(&dir, n, &flow)?;
+    let _ = deals::save_meta(&dir, n, &meta);
+    Ok(deal_view(&flow, &meta))
+}
+
+fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value {
+    let mut v = deals::view(flow);
+    v["n"] = hex(flow.nullifier()).into();
+    v["invoice_id"] = flow.deal().invoice.invoice_id.clone().into();
+    v["amount_zat"] = flow.deal().invoice.amount_zat.into();
+    v["advance_zat"] = flow.deal().advance_zat.into();
+    v["due_date"] = flow.deal().invoice.due_date.into();
+    v["letter_sent"] = meta.letter_sent.into();
+    v["problem"] = meta.problem.clone().into();
+    if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
+        let i = pay::Intent::of(flow);
+        v["intent"] = json!({ "n": i.n, "amount_zat": i.amount_zat, "address": i.address });
+    }
+    v
+}
+
+/// Every deal moves on its own every two minutes (the board is rescanned as often).
+async fn drive_all(st: State) {
+    loop {
+        tokio::time::sleep(board::EVERY).await;
+        let dir = st.data_dir.join(DEALS_DIR);
+        for n in deals::list(&dir) {
+            if let Err(e) = drive(&st, &n).await {
+                eprintln!("deal {}…: {e}", &n[..8]);
+            }
+        }
+    }
+}
+
+/// The deal pipeline (HNK-26.T16): each deal, its state and what it waits for.
+async fn deals_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    let dir = st.data_dir.join(DEALS_DIR);
+    let mut out: Vec<Value> = deals::list(&dir)
+        .iter()
+        .filter_map(|n| {
+            Some(deal_view(
+                &deals::load_flow(&dir, n)?,
+                &deals::load_meta(&dir, n),
+            ))
+        })
+        .collect();
+    out.reverse();
+    Json(json!({ "deals": out })).into_response()
+}
+
+/// Moves one deal on now, instead of waiting for the next round.
+async fn deal_step(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(n): Path<String>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    match drive(&st, &n).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(StatusCode::NOT_FOUND, &e),
+    }
+}
+
+/// Pays the advance of a sealed deal with the operator's passkey approval of exactly it (D-43,
+/// `pay::advance`), then sends the supplier the txid.
+async fn deal_pay(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(n): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    let Some(approval) = body["approval"].as_str().map(String::from) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "approve the payment with your passkey first",
+        );
+    };
+    let _g = st.deal_lock.lock().await;
+    let dir = st.data_dir.join(DEALS_DIR);
+    let Some(mut flow) = deals::load_flow(&dir, &n) else {
+        return error(StatusCode::NOT_FOUND, "no deal with this N");
+    };
+    let fin = match financier(&st).await {
+        Ok(f) => f,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, &e),
+    };
+    let console = st.console.clone().expect("signed in implies a console");
+    let b = st.board.clone();
+    let date = (unix_now() / 86_400) as u32;
+    let paid = tokio::task::spawn_blocking(move || {
+        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+        let r = pay::advance(&console, &approval, &fin, &mut flow, date).map(|_| ());
+        (r, flow)
+    })
+    .await
+    .expect("wallet task");
+    let (result, flow) = paid;
+    if let Err(e) = deals::save_flow(&dir, &n, &flow) {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &e);
+    }
+    if let Err(e) = result {
+        return error(StatusCode::BAD_GATEWAY, &e.to_string());
+    }
+    let mut meta = deals::load_meta(&dir, &n);
+    let txid = deals::view(&flow)["advance_txid"]
+        .as_str()
+        .map(String::from);
+    if let (Some(txid), Some(a)) = (txid, offer::load(&dir, &n)) {
+        if let (Ok(me), Ok(to)) = (
+            message::unhex::<32>(&st.public.mailbox_pk),
+            message::unhex::<32>(&a.supplier_mailbox_pk),
+        ) {
+            if let Ok(bytes) =
+                deals::advance_message(&st.financier, &me, &to, &flow, &txid, unix_now())
+            {
+                meta.advance_sent = st.mail.send(&to, &bytes).await.is_ok();
+            }
+        }
+    }
+    let _ = deals::save_meta(&dir, &n, &meta);
+    println!("console: advance paid");
+    Json(deal_view(&flow, &meta)).into_response()
+}
+
 const DEALS_DIR: &str = "deals";
 
 fn unix_now() -> u64 {
@@ -1140,7 +1455,22 @@ async fn offer_accept(
         Err(e) => Err(e),
     };
     match sent {
-        Ok(_) => Json(json!({ "ok": true, "deal": a })).into_response(),
+        Ok(_) => {
+            // HNK-26.T16: the deal's flow and its letter start now; the driver moves it on.
+            let started = deals::start(
+                &deals,
+                &a,
+                &st.financier,
+                &st.public.wallet_address,
+                &st.name().unwrap_or_default(),
+            );
+            let st2 = st.clone();
+            let n = a.n.clone();
+            tokio::spawn(async move {
+                let _ = drive(&st2, &n).await;
+            });
+            Json(json!({ "ok": true, "deal": a, "flow": started.err() })).into_response()
+        }
         Err(e) => {
             // Nothing reached the supplier: forget the terms so the operator can try again.
             offer::forget(&deals, &a.n);
@@ -1365,6 +1695,9 @@ fn app(st: State) -> Router {
         .route("/node/mail/{id}", delete(mail_remove))
         .route("/node/console/offers/{id}/accept", post(offer_accept))
         .route("/node/console/offers/{id}/decline", post(offer_decline))
+        .route("/node/console/deals", get(deals_list))
+        .route("/node/console/deals/{n}/step", post(deal_step))
+        .route("/node/console/deals/{n}/pay", post(deal_pay))
         .route(
             "/node/console/mandate/private",
             get(private_get).post(private_set),
@@ -1548,7 +1881,16 @@ async fn main() {
                 wallet: Arc::new(node.wallet.clone()),
                 fund: Arc::default(),
                 plans: Arc::default(),
+                board_watch: Arc::new(node.board_watch.clone()),
+                lightwalletd: cfg.lightwalletd.clone(),
+                board_address: Arc::new(std::sync::RwLock::new(
+                    std::env::var("BOARD_ADDRESS")
+                        .ok()
+                        .filter(|a| !a.is_empty()),
+                )),
+                deal_lock: Arc::default(),
             };
+            tokio::spawn(drive_all(st.clone()));
             axum::serve(listener, app(st))
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
