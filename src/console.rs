@@ -518,9 +518,14 @@ impl Console {
             .map(|(_, c)| c.clone())
     }
 
-    /// Removes a paired passkey. The passkey of the session itself cannot be removed (sign in
-    /// with another one to do that), so a stolen session cannot lock the owner out of its own
-    /// device, and the last passkey always stays.
+    /// Ends every session opened with credential `cred`.
+    fn end_sessions_of(&self, cred: &str) {
+        self.sessions.lock().unwrap().retain(|_, (_, c)| c != cred);
+    }
+
+    /// Removes a paired passkey and ends the sessions it opened. The passkey of the session
+    /// itself cannot be removed (sign in with another one to do that), so a stolen session cannot
+    /// lock the owner out of its own device, and the last passkey always stays.
     pub fn remove_device(&self, token: &str, id: &str) -> Result<usize, PairError> {
         if self.demo {
             return Err(PairError::DemoOff);
@@ -540,6 +545,8 @@ impl Console {
             &serde_json::to_vec(&stored).expect("json"),
         )
         .map_err(|_| PairError::Store)?;
+        // A removed passkey must not keep a console open somewhere else.
+        self.end_sessions_of(id);
         Ok(stored.len())
     }
 
@@ -648,6 +655,17 @@ mod tests {
         );
         assert_eq!(c.start(&code).unwrap_err(), PairError::NoCode, "used up");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn sessions_end_with_their_passkey() {
+        let d = dir("sessions");
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, false).unwrap();
+        let a = c.open_session("aa".into());
+        let b = c.open_session("bb".into());
+        c.end_sessions_of("aa");
+        assert!(!c.session(&a));
+        assert!(c.session(&b));
     }
 
     #[test]

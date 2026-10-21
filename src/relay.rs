@@ -276,5 +276,7 @@ mod tests {
         let f = v["fingerprint"].as_str().unwrap();
         assert_eq!(f.len(), 19, "16 base32 characters in 4 groups");
         assert!(f.split('-').all(|g| g.len() == 4));
+        // The same vector as jitsuinfi-frontend tests/account.test.ts (`financierFingerprint`).
+        assert_eq!(fingerprint(&[9; 32]), "XEUS-G6UK-2CXX-G237");
     }
 }
