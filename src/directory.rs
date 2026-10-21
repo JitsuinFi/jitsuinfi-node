@@ -36,6 +36,9 @@ pub struct Listing {
     pub financier_pk: String,
     pub mandate: Mandate,
     pub listed_at: u64,
+    /// The provider's attested classes (HNK-30.T21, D-48); absent until attested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reputation: Option<crate::reputation::Reputation>,
 }
 
 /// The fingerprint inside a contact card (`jitsuin-contact-v1:` + base64url JSON).
@@ -85,12 +88,17 @@ pub fn listing(
         financier_pk: hex(&pk),
         mandate,
         listed_at: now,
+        reputation: None,
     })
 }
 
 /// Adds or replaces the listing for its financier key.
-pub fn upsert(list: &mut Vec<Listing>, l: Listing) -> Result<(), String> {
+pub fn upsert(list: &mut Vec<Listing>, mut l: Listing) -> Result<(), String> {
     if let Some(i) = list.iter().position(|x| x.financier_pk == l.financier_pk) {
+        // a new mandate keeps the attested reputation of the same key
+        if l.reputation.is_none() {
+            l.reputation = list[i].reputation.take();
+        }
         list[i] = l;
     } else if list.len() >= MAX {
         return Err("the directory is full".into());
