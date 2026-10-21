@@ -13,6 +13,11 @@
 //! signature and counter, then a random session token in a `__Host-` cookie (`Secure`,
 //! `HttpOnly`, `SameSite=Strict`, 8 hours). The node keeps only the token's SHA-256, in memory:
 //! a restart signs everyone out.
+//!
+//! Payment approvals (HNK-26.T15, BL-D24-09, D-43): a session is not enough to move money. Each
+//! advance needs a fresh assertion (user verification) for that payment's intent hash (N, amount,
+//! address); the approval is used once, within 5 minutes, and only for that exact intent. An AI
+//! agent or malware that holds the session cookie cannot touch the authenticator, so it cannot pay.
 
 use std::collections::HashMap;
 use std::fs;
@@ -37,6 +42,7 @@ const CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_TRIES: u32 = 5;
 const MAX_CREDENTIALS: usize = 10;
 const LOGIN_TTL: Duration = Duration::from_secs(2 * 60);
+const APPROVAL_TTL: Duration = Duration::from_secs(5 * 60);
 pub const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 pub const COOKIE: &str = "__Host-jitsuin_console";
 
@@ -99,6 +105,8 @@ pub enum PairError {
     Store,
     NotPaired,
     LoginGone,
+    /// No unused, unexpired approval for this exact payment.
+    NotApproved,
 }
 
 impl PairError {
@@ -112,7 +120,8 @@ impl PairError {
             PairError::Rejected => "the passkey response did not verify",
             PairError::Store => "the node could not save the passkey",
             PairError::NotPaired => "no passkey is paired with this console yet; pair one first",
-            PairError::LoginGone => "this sign-in has expired or was already used; try again",
+            PairError::LoginGone => "this passkey request has expired or was already used; try again",
+            PairError::NotApproved => "this payment has no passkey approval (or it expired, was used, or was for another payment)",
         }
     }
 }
@@ -126,8 +135,15 @@ pub struct Console {
     logins: Mutex<HashMap<String, (PasskeyAuthentication, Instant)>>,
     /// SHA-256 of each session token, and when the session ends.
     sessions: Mutex<HashMap<String, Instant>>,
+    /// Approval ceremonies: state, the intent hash shown to the operator, start time.
+    approving: Mutex<HashMap<String, Approving>>,
+    /// Granted approvals: intent hash and when granted; removed when used.
+    approvals: Mutex<HashMap<String, ([u8; 32], Instant)>>,
     lock: Mutex<()>,
 }
+
+/// An approval ceremony: its state, the intent hash shown, its start.
+type Approving = (PasskeyAuthentication, [u8; 32], Instant);
 
 fn token_hash(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
@@ -176,6 +192,8 @@ impl Console {
             ceremonies: Mutex::new(HashMap::new()),
             logins: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            approving: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
             lock: Mutex::new(()),
         })
     }
@@ -302,28 +320,7 @@ impl Console {
         if at.elapsed() >= LOGIN_TTL {
             return Err(PairError::LoginGone);
         }
-        let result = self
-            .webauthn
-            .finish_passkey_authentication(credential, &state)
-            .map_err(|_| PairError::Rejected)?;
-        if !result.user_verified() {
-            return Err(PairError::Rejected);
-        }
-        {
-            let _g = self.lock.lock().unwrap();
-            let mut stored = self.stored();
-            let mut changed = false;
-            for s in &mut stored {
-                changed |= s.passkey.update_credential(&result) == Some(true);
-            }
-            if changed {
-                write_private(
-                    &self.credentials,
-                    &serde_json::to_vec(&stored).expect("json"),
-                )
-                .map_err(|_| PairError::Store)?;
-            }
-        }
+        self.verify_assertion(&state, credential)?;
         let token = random_hex::<32>();
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, end| *end > Instant::now());
@@ -342,6 +339,107 @@ impl Console {
 
     pub fn logout(&self, token: &str) {
         self.sessions.lock().unwrap().remove(&token_hash(token));
+    }
+
+    /// Checks an assertion with user verification against its state and saves the counter.
+    fn verify_assertion(
+        &self,
+        state: &PasskeyAuthentication,
+        credential: &PublicKeyCredential,
+    ) -> Result<(), PairError> {
+        let result = self
+            .webauthn
+            .finish_passkey_authentication(credential, state)
+            .map_err(|_| PairError::Rejected)?;
+        if !result.user_verified() {
+            return Err(PairError::Rejected);
+        }
+        let _g = self.lock.lock().unwrap();
+        let mut stored = self.stored();
+        let mut changed = false;
+        for s in &mut stored {
+            changed |= s.passkey.update_credential(&result) == Some(true);
+        }
+        if changed {
+            write_private(
+                &self.credentials,
+                &serde_json::to_vec(&stored).expect("json"),
+            )
+            .map_err(|_| PairError::Store)?;
+        }
+        Ok(())
+    }
+
+    /// Starts a passkey approval of one payment (its intent hash, see `pay::Intent`).
+    pub fn approve_start(
+        &self,
+        intent: [u8; 32],
+    ) -> Result<(String, RequestChallengeResponse), PairError> {
+        let passkeys: Vec<Passkey> = self.stored().into_iter().map(|s| s.passkey).collect();
+        if passkeys.is_empty() {
+            return Err(PairError::NotPaired);
+        }
+        let (options, state) = self
+            .webauthn
+            .start_passkey_authentication(&passkeys)
+            .map_err(|_| PairError::Rejected)?;
+        let id = random_hex::<16>();
+        let mut a = self.approving.lock().unwrap();
+        a.retain(|_, (_, _, at)| at.elapsed() < LOGIN_TTL);
+        a.insert(id.clone(), (state, intent, Instant::now()));
+        Ok((id, options))
+    }
+
+    /// Verifies the operator's assertion and grants a one-time approval of that intent; returns
+    /// the approval id the payment must present.
+    pub fn approve_finish(
+        &self,
+        ceremony: &str,
+        credential: &PublicKeyCredential,
+    ) -> Result<String, PairError> {
+        let (state, intent, at) = self
+            .approving
+            .lock()
+            .unwrap()
+            .remove(ceremony)
+            .ok_or(PairError::LoginGone)?;
+        if at.elapsed() >= LOGIN_TTL {
+            return Err(PairError::LoginGone);
+        }
+        self.verify_assertion(&state, credential)?;
+        let id = random_hex::<16>();
+        let mut g = self.approvals.lock().unwrap();
+        g.retain(|_, (_, at)| at.elapsed() < APPROVAL_TTL);
+        g.insert(id.clone(), (intent, Instant::now()));
+        Ok(id)
+    }
+
+    /// Uses up the approval `id` for exactly `intent`. An approval for another intent is left in
+    /// place (it may still serve its own payment); an expired one is dropped.
+    pub fn take_approval(&self, id: &str, intent: &[u8; 32]) -> Result<(), PairError> {
+        let mut g = self.approvals.lock().unwrap();
+        match g.get(id) {
+            Some((i, at)) if at.elapsed() < APPROVAL_TTL && i == intent => {
+                g.remove(id);
+                Ok(())
+            }
+            Some((_, at)) if at.elapsed() >= APPROVAL_TTL => {
+                g.remove(id);
+                Err(PairError::NotApproved)
+            }
+            _ => Err(PairError::NotApproved),
+        }
+    }
+
+    #[cfg(test)]
+    fn grant_for_test(&self, intent: [u8; 32], age: Duration) -> String {
+        let id = random_hex::<16>();
+        let at = Instant::now().checked_sub(age).expect("age fits");
+        self.approvals
+            .lock()
+            .unwrap()
+            .insert(id.clone(), (intent, at));
+        id
     }
 }
 
@@ -413,6 +511,36 @@ mod tests {
             PairError::LoginGone
         );
         assert!(!c.session("not-a-token"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_approval_pays_once_and_only_its_own_intent() {
+        let d = dir("approve");
+        let c = Console::new("http://localhost:8788", &d, [1; 16]).unwrap();
+        assert_eq!(c.approve_start([7; 32]).unwrap_err(), PairError::NotPaired);
+        let id = c.grant_for_test([7; 32], Duration::ZERO);
+        assert_eq!(
+            c.take_approval("nope", &[7; 32]).unwrap_err(),
+            PairError::NotApproved
+        );
+        assert_eq!(
+            c.take_approval(&id, &[8; 32]).unwrap_err(),
+            PairError::NotApproved,
+            "another payment"
+        );
+        c.take_approval(&id, &[7; 32]).unwrap();
+        assert_eq!(
+            c.take_approval(&id, &[7; 32]).unwrap_err(),
+            PairError::NotApproved,
+            "used once"
+        );
+        let old = c.grant_for_test([7; 32], APPROVAL_TTL + Duration::from_secs(1));
+        assert_eq!(
+            c.take_approval(&old, &[7; 32]).unwrap_err(),
+            PairError::NotApproved,
+            "expired"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
