@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // lightwalletd serves the deal API (next task)
 pub struct Config {
     pub port: u16,
     /// The Railway Volume (or a local folder): node.key, the wallet, its age identity, the board.
