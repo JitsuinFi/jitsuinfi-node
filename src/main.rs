@@ -170,6 +170,12 @@ async fn set_name(
     if let Err((status, msg)) = st.signed_in(&headers, true) {
         return error(status, msg);
     }
+    if st.console.as_ref().is_some_and(|c| c.demo) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this is the demo console: that is turned off here",
+        );
+    }
     let Some(name) = body["name"].as_str().and_then(clean_name) else {
         return error(StatusCode::BAD_REQUEST, "type a name");
     };
@@ -188,6 +194,12 @@ async fn set_name(
 async fn device_code(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
     if let Err((status, msg)) = st.signed_in(&headers, true) {
         return error(status, msg);
+    }
+    if st.console.as_ref().is_some_and(|c| c.demo) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this is the demo console: that is turned off here",
+        );
     }
     let origin = st.origin.clone().unwrap_or_default();
     match console::new_code(&st.data_dir) {
@@ -323,6 +335,12 @@ async fn mail_remove(
     if let Err((status, msg)) = st.signed_in(&headers, true) {
         return error(status, msg);
     }
+    if st.console.as_ref().is_some_and(|c| c.demo) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this is the demo console: that is turned off here",
+        );
+    }
     match st.mail.remove(&id).await {
         Ok(true) => Json(json!({ "ok": true })).into_response(),
         Ok(false) => error(
@@ -341,6 +359,7 @@ fn pair_status(e: &console::PairError) -> StatusCode {
         NotApproved => StatusCode::FORBIDDEN,
         Locked => StatusCode::TOO_MANY_REQUESTS,
         OwnDevice => StatusCode::CONFLICT,
+        DemoOff => StatusCode::FORBIDDEN,
         NoDevice => StatusCode::NOT_FOUND,
         Wrong | Rejected => StatusCode::FORBIDDEN,
         Full => StatusCode::CONFLICT,
@@ -468,7 +487,8 @@ async fn session(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
     let paired = st.console.as_ref().is_some_and(|c| !c.stored().is_empty());
     // The financier's name only to its own session: /node/console/session is public.
     let name = if open { st.name() } else { None };
-    Json(json!({ "signed_in": open, "paired": paired, "console": st.console.is_some(), "name": name }))
+    let demo = st.console.as_ref().is_some_and(|c| c.demo);
+    Json(json!({ "signed_in": open, "paired": paired, "console": st.console.is_some(), "name": name, "demo": demo }))
         .into_response()
 }
 
@@ -670,6 +690,7 @@ async fn main() {
                     &cfg.data_dir,
                     node.keys.console_user(),
                     cfg.setup_code.as_deref(),
+                    cfg.demo,
                 )
                 .map_err(|e| eprintln!("console off: {e}"))
                 .ok()

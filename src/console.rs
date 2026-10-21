@@ -46,6 +46,8 @@ pub const CODE_TTL: Duration = Duration::from_secs(15 * 60);
 const CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_TRIES: u32 = 5;
 const MAX_CREDENTIALS: usize = 10;
+/// Demo console (HNK-26.T26, D-46 C): anyone pairs without an invite; the newest passkeys are kept.
+const DEMO_KEEP: usize = 200;
 const LOGIN_TTL: Duration = Duration::from_secs(2 * 60);
 const APPROVAL_TTL: Duration = Duration::from_secs(5 * 60);
 pub const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -134,6 +136,8 @@ pub enum PairError {
     Locked,
     /// The session's own passkey.
     OwnDevice,
+    /// Turned off in the demo console.
+    DemoOff,
     NoDevice,
 }
 
@@ -149,6 +153,7 @@ impl PairError {
             PairError::Store => "the node could not save the passkey",
             PairError::NotPaired => "no passkey is paired with this console yet; pair one first",
             PairError::LoginGone => "this passkey request has expired or was already used; try again",
+            PairError::DemoOff => "this is the demo console: that is turned off here",
             PairError::OwnDevice => "this is the passkey you signed in with; sign in with another one to remove it",
             PairError::NoDevice => "no such passkey on this node",
             PairError::Locked => "too many wrong codes; wait 15 minutes and try again",
@@ -159,6 +164,8 @@ impl PairError {
 
 pub struct Console {
     webauthn: Webauthn,
+    /// Demo console: pairing without an invite, nothing that touches money or other visitors.
+    pub demo: bool,
     origin: String,
     /// SHA-256 of the provider's setup code (first passkey only).
     setup: Option<String>,
@@ -220,6 +227,7 @@ impl Console {
         data_dir: &Path,
         user: [u8; 16],
         setup_code: Option<&str>,
+        demo: bool,
     ) -> Result<Self, String> {
         if setup_code.is_some_and(|c| c.chars().filter(|c| c.is_ascii_alphanumeric()).count() < 16)
         {
@@ -235,6 +243,7 @@ impl Console {
             .map_err(|e| format!("NODE_ORIGIN: {e}"))?;
         Ok(Console {
             webauthn,
+            demo,
             origin: origin.trim_end_matches('/').to_string(),
             setup: setup_code.map(code_hash),
             setup_fails: Mutex::new((0, None)),
@@ -260,6 +269,9 @@ impl Console {
     /// Checks and uses up the pairing code, then starts `create()`.
     pub fn start(&self, code: &str) -> Result<(String, CreationChallengeResponse), PairError> {
         let _g = self.lock.lock().unwrap();
+        if self.demo {
+            return self.registration();
+        }
         if self.setup_matches(code, !self.stored().is_empty())? {
             return self.registration();
         }
@@ -316,13 +328,18 @@ impl Console {
     /// `create()` options for a new passkey, excluding the ones already paired.
     fn registration(&self) -> Result<(String, CreationChallengeResponse), PairError> {
         let stored = self.stored();
-        if stored.len() >= MAX_CREDENTIALS {
+        if !self.demo && stored.len() >= MAX_CREDENTIALS {
             return Err(PairError::Full);
         }
-        let exclude = stored
-            .iter()
-            .map(|s| s.passkey.cred_id().clone())
-            .collect::<Vec<_>>();
+        // The demo keeps many visitors' passkeys; excluding them all would bloat every request.
+        let exclude = if self.demo {
+            vec![]
+        } else {
+            stored
+                .iter()
+                .map(|s| s.passkey.cred_id().clone())
+                .collect::<Vec<_>>()
+        };
         let (options, state) = self
             .webauthn
             .start_passkey_registration(self.user, "financier", "Financier console", Some(exclude))
@@ -370,6 +387,10 @@ impl Console {
             origin: Some(self.origin.clone()),
             last_used: Some(now()),
         });
+        if self.demo && stored.len() > DEMO_KEEP {
+            let drop = stored.len() - DEMO_KEEP;
+            stored.drain(..drop);
+        }
         write_private(
             &self.credentials,
             &serde_json::to_vec(&stored).expect("json"),
@@ -471,8 +492,10 @@ impl Console {
     /// The paired passkeys, for the signed-in session `token`.
     pub fn devices(&self, token: &str) -> Vec<Device> {
         let current = self.session_credential(token);
+        let demo = self.demo;
         self.stored()
             .iter()
+            .filter(|s| !demo || current.as_deref() == Some(cred_hex(s.passkey.cred_id()).as_str()))
             .map(|s| {
                 let id = cred_hex(s.passkey.cred_id());
                 Device {
@@ -499,6 +522,9 @@ impl Console {
     /// with another one to do that), so a stolen session cannot lock the owner out of its own
     /// device, and the last passkey always stays.
     pub fn remove_device(&self, token: &str, id: &str) -> Result<usize, PairError> {
+        if self.demo {
+            return Err(PairError::DemoOff);
+        }
         if self.session_credential(token).as_deref() == Some(id) {
             return Err(PairError::OwnDevice);
         }
@@ -522,6 +548,9 @@ impl Console {
         &self,
         intent: [u8; 32],
     ) -> Result<(String, RequestChallengeResponse), PairError> {
+        if self.demo {
+            return Err(PairError::DemoOff);
+        }
         let passkeys: Vec<Passkey> = self.stored().into_iter().map(|s| s.passkey).collect();
         if passkeys.is_empty() {
             return Err(PairError::NotPaired);
@@ -605,7 +634,7 @@ mod tests {
     #[test]
     fn code_is_one_time_and_tolerates_format() {
         let d = dir("once");
-        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, false).unwrap();
         assert_eq!(c.start("AAAA-BBBB").unwrap_err(), PairError::NoCode);
         let code = new_code(&d).unwrap();
         assert_eq!(code.len(), 19);
@@ -624,7 +653,7 @@ mod tests {
     #[test]
     fn wrong_tries_and_expiry_drop_the_code() {
         let d = dir("tries");
-        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, false).unwrap();
         let code = new_code(&d).unwrap();
         for _ in 0..MAX_TRIES {
             assert_eq!(c.start("WRONG-CODE").unwrap_err(), PairError::Wrong);
@@ -646,7 +675,7 @@ mod tests {
     #[test]
     fn sign_in_needs_a_paired_passkey_and_a_live_challenge() {
         let d = dir("login");
-        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, false).unwrap();
         assert_eq!(c.login_start().unwrap_err(), PairError::NotPaired);
         let cred: PublicKeyCredential = serde_json::from_value(serde_json::json!({
             "id": "AA", "rawId": "AA", "type": "public-key",
@@ -665,8 +694,8 @@ mod tests {
     fn the_setup_code_pairs_the_first_passkey_only() {
         let d = dir("setup");
         let setup = "SETU-PCOD-EFOR-NODE";
-        assert!(Console::new("http://localhost:8788", &d, [1; 16], Some("short")).is_err());
-        let c = Console::new("http://localhost:8788", &d, [1; 16], Some(setup)).unwrap();
+        assert!(Console::new("http://localhost:8788", &d, [1; 16], Some("short"), false).is_err());
+        let c = Console::new("http://localhost:8788", &d, [1; 16], Some(setup), false).unwrap();
         // format-tolerant, and usable again until a passkey is actually paired
         c.start(&setup.to_lowercase()).unwrap();
         c.start(setup).unwrap();
@@ -681,7 +710,7 @@ mod tests {
             "locked even for the right code"
         );
         // once a passkey is paired, the setup code no longer pairs
-        let c = Console::new("http://localhost:8788", &d, [1; 16], Some(setup)).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], Some(setup), false).unwrap();
         assert!(c.setup_matches(setup, false).unwrap());
         assert!(!c.setup_matches(setup, true).unwrap());
         assert_eq!(c.start("ANY").unwrap_err(), PairError::Wrong);
@@ -691,7 +720,7 @@ mod tests {
     #[test]
     fn devices_without_a_session_list_nothing_current_and_unknown_ids_are_refused() {
         let d = dir("devices");
-        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, false).unwrap();
         assert!(c.devices("no-session").is_empty());
         assert_eq!(
             c.remove_device("no-session", "abcd").unwrap_err(),
@@ -709,9 +738,24 @@ mod tests {
     }
 
     #[test]
+    fn the_demo_console_pairs_without_an_invite_and_moves_no_money() {
+        let d = dir("demo");
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, true).unwrap();
+        let (_, options) = c.start("").unwrap();
+        let o = serde_json::to_value(&options).unwrap();
+        assert!(o["publicKey"]["excludeCredentials"]
+            .as_array()
+            .is_none_or(|a| a.is_empty()));
+        assert_eq!(c.approve_start([1; 32]).unwrap_err(), PairError::DemoOff);
+        assert_eq!(c.remove_device("t", "x").unwrap_err(), PairError::DemoOff);
+        assert!(c.devices("no-session").is_empty());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn an_approval_pays_once_and_only_its_own_intent() {
         let d = dir("approve");
-        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None, false).unwrap();
         assert_eq!(c.approve_start([7; 32]).unwrap_err(), PairError::NotPaired);
         let id = c.grant_for_test([7; 32], Duration::ZERO);
         assert_eq!(
@@ -741,10 +785,10 @@ mod tests {
     #[test]
     fn origin_must_be_https_except_localhost() {
         let d = dir("origin");
-        assert!(Console::new("http://node.example", &d, [1; 16], None).is_err());
-        assert!(Console::new("https://node.example", &d, [1; 16], None).is_ok());
+        assert!(Console::new("http://node.example", &d, [1; 16], None, false).is_err());
+        assert!(Console::new("https://node.example", &d, [1; 16], None, false).is_ok());
         assert_eq!(
-            Console::new("https://node.example", &d, [1; 16], None)
+            Console::new("https://node.example", &d, [1; 16], None, false)
                 .unwrap()
                 .finish(
                     "x",

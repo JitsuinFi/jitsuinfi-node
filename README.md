@@ -45,6 +45,7 @@ A code is used up on its first correct try and dropped after five wrong ones. Th
 | `NODE_ORIGIN` | the console's origin; defaults to `https://$RAILWAY_PUBLIC_DOMAIN` on Railway; without either the console is off |
 | `SETUP_CODE` | optional: the provider's code for the first console passkey (invite link `<origin>/console/pair#<code>`) |
 | `FINANCIER_NAME` | optional: a first display name for the financier; the financier changes it in the console (Profile), saved in `financier-name.txt` |
+| `DEMO` | `1` for the judges' demo console: pairing without an invite, payments, approvals, device removal, invites, name changes and message removal off; each visitor sees only its own passkey; the newest 200 passkeys are kept |
 | `PORT` | set by Railway |
 
 ## Deploy

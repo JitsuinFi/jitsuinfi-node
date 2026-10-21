@@ -72,3 +72,8 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: npx --yes @railway/cli@5.71.0 up deploy --path-as-root --no-gitignore --service financier-node --ci --detach
+      # The judges' demo console (HNK-26.T26): the same binaries, DEMO=1 on that service.
+      - name: railway up (demo)
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: npx --yes @railway/cli@5.71.0 up deploy --path-as-root --no-gitignore --service financier-node-demo --ci --detach
