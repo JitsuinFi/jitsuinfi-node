@@ -5,6 +5,7 @@
 //! Runs behind Railway's HTTPS edge, which forwards plain HTTP to PORT inside the container.
 
 mod board;
+mod buyers;
 mod config;
 mod console;
 mod keys;
@@ -106,6 +107,8 @@ struct State {
     name: Arc<std::sync::RwLock<Option<String>>>,
     /// Signs the node's replies in a deal (commitment opening, letter, advance).
     financier: Arc<ed25519_dalek::SigningKey>,
+    /// Buyers the financier knows from KYC (HNK-26.T7).
+    buyers: Arc<buyers::Registry>,
 }
 
 impl State {
@@ -300,9 +303,16 @@ async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
         Ok((mut messages, refused)) => {
             // Offers are checked here, with the node's keys, not in the console (HNK-26.T5).
             let deals = st.data_dir.join(DEALS_DIR);
-            for m in messages.iter_mut().filter(|m| m["type"] == "deal.offer") {
-                if let Some(h) = m["relay_id"].as_str().and_then(|id| st.mail.header(id)) {
+            for m in messages.iter_mut() {
+                let Some(h) = m["relay_id"].as_str().and_then(|id| st.mail.header(id)) else {
+                    continue;
+                };
+                if h["type"] == "deal.offer" {
                     m["offer"] = offer::summary(&h, &deals);
+                }
+                // A buyer history from an identity key the financier did not register is flagged.
+                if h["type"] == "history.chain" {
+                    m["identity"] = st.buyers.flag(&h);
                 }
             }
             Json(json!({ "messages": messages, "refused": refused })).into_response()
@@ -359,6 +369,73 @@ async fn mail_remove(
             "list the mailbox again; this message is not in it",
         ),
         Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    }
+}
+
+/// The KYC registry of buyers (HNK-26.T7): read from a signed-in console.
+async fn buyers_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    Json(json!({ "buyers": st.buyers.list() })).into_response()
+}
+
+/// Writes to the registry: signed in, from the console's own origin, not in the demo.
+fn buyers_writable(st: &State, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
+    st.signed_in(headers, true)?;
+    if st.console.as_ref().is_some_and(|c| c.demo) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this is the demo console: that is turned off here",
+        ));
+    }
+    Ok(())
+}
+
+fn registry_error(e: buyers::RegistryError) -> Response {
+    match e {
+        buyers::RegistryError::Input(msg) => error(StatusCode::BAD_REQUEST, msg),
+        buyers::RegistryError::Full => error(
+            StatusCode::CONFLICT,
+            "the registry is full: remove a buyer first",
+        ),
+        buyers::RegistryError::Io(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the node could not save the registry",
+        ),
+    }
+}
+
+async fn buyers_add(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    match st.buyers.add(
+        body["identity_pk"].as_str().unwrap_or_default(),
+        body["label"].as_str().unwrap_or_default(),
+        unix_now(),
+    ) {
+        Ok(b) => Json(json!({ "ok": true, "buyer": b })).into_response(),
+        Err(e) => registry_error(e),
+    }
+}
+
+async fn buyers_remove(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(pk): Path<String>,
+) -> Response {
+    if let Err((status, msg)) = buyers_writable(&st, &headers) {
+        return error(status, msg);
+    }
+    match st.buyers.remove(&pk) {
+        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "this buyer is not registered"),
+        Err(e) => registry_error(e),
     }
 }
 
@@ -674,6 +751,8 @@ fn app(st: State) -> Router {
         .route("/node/mail", get(mail_list))
         .route("/node/mail/{id}", delete(mail_remove))
         .route("/node/console/offers/{id}/accept", post(offer_accept))
+        .route("/node/console/buyers", get(buyers_list).post(buyers_add))
+        .route("/node/console/buyers/{pk}", delete(buyers_remove))
         .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
         .route("/console/", get(|| console_file(Path(String::new()))))
         .route(
@@ -840,6 +919,7 @@ async fn main() {
                 origin: cfg.node_origin.clone(),
                 mail: Arc::new(mail::Mail::new(relay, node.keys.mailbox())),
                 financier: Arc::new(node.keys.financier()),
+                buyers: Arc::new(buyers::Registry::load(&cfg.data_dir).unwrap_or_else(|e| fail(e))),
             };
             axum::serve(listener, app(st))
                 .with_graceful_shutdown(async {
