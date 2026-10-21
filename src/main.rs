@@ -10,6 +10,7 @@ mod console;
 mod keys;
 mod mail;
 mod message;
+mod pay;
 mod relay;
 mod setup;
 
@@ -143,6 +144,49 @@ impl State {
     }
 }
 
+/// Starts the passkey approval of one payment; the console shows the intent it approves.
+async fn approve_start(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(intent): Json<pay::Intent>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    let c = st.console.as_deref().expect("signed in implies a console");
+    match c.approve_start(intent.hash()) {
+        Ok((ceremony, options)) => {
+            Json(json!({ "ceremony": ceremony, "options": options })).into_response()
+        }
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
+/// Grants a one-time approval of that payment after a fresh assertion with user verification.
+async fn approve_finish(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    let c = st.console.as_deref().expect("signed in implies a console");
+    let (Some(ceremony), Ok(credential)) = (
+        body["ceremony"].as_str(),
+        serde_json::from_value(body["credential"].clone()),
+    ) else {
+        return error(StatusCode::BAD_REQUEST, "ceremony or credential is missing");
+    };
+    match c.approve_finish(ceremony, &credential) {
+        Ok(approval) => {
+            println!("console: payment approved");
+            Json(json!({ "approval": approval, "expires_in": 300 })).into_response()
+        }
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
 async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
     if let Err((status, msg)) = st.signed_in(&headers, false) {
         return error(status, msg);
@@ -205,6 +249,7 @@ fn pair_status(e: &console::PairError) -> StatusCode {
     match e {
         NoCode | Expired | Ceremony | LoginGone => StatusCode::GONE,
         NotPaired => StatusCode::CONFLICT,
+        NotApproved => StatusCode::FORBIDDEN,
         Wrong | Rejected => StatusCode::FORBIDDEN,
         Full => StatusCode::CONFLICT,
         Store => StatusCode::INTERNAL_SERVER_ERROR,
@@ -386,6 +431,8 @@ fn app(st: State) -> Router {
         .route("/node/console/login/finish", post(login_finish))
         .route("/node/console/session", get(session))
         .route("/node/console/logout", post(logout))
+        .route("/node/console/approve/start", post(approve_start))
+        .route("/node/console/approve/finish", post(approve_finish))
         .route("/node/board", get(board_snapshot))
         .route("/node/mail", get(mail_list))
         .route("/node/mail/{id}", delete(mail_remove))

@@ -160,3 +160,14 @@ document.addEventListener("DOMContentLoaded", () => {
     $("signin").hidden = false;
   });
 });
+
+// Payment approval (HNK-26.T15): a fresh passkey assertion for one payment's intent (N, amount,
+// address). The deal pipeline (HNK-26.T16) calls this before the node pays an advance; the
+// approval id it returns is used once, within 5 minutes, for that payment only.
+async function approvePayment(intent) {
+  const start = await post("/node/console/approve/start", intent);
+  const cred = await navigator.credentials.get({ publicKey: requestOptions(start.options.publicKey) });
+  const done = await post("/node/console/approve/finish", { ceremony: start.ceremony, credential: assertionJson(cred) });
+  return done.approval;
+}
+
