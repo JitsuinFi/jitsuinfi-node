@@ -61,3 +61,9 @@ A code is used up on its first correct try and dropped after five wrong ones. Th
 CI builds `jitsuin-node` and zcash-devtool on ubuntu-24.04 (zcash-devtool cached by revision) and runs `railway up deploy --service financier-node`: `deploy/Dockerfile` only copies the two binaries, so Railway never compiles. Secrets: `ZCASH_DEPLOY_KEY` (read-only deploy key of `jitsuinfi-zcash`), `RAILWAY_TOKEN` (project token of `jitsuinfi-relay`). The service mounts a Railway Volume at `/data`.
 
 Status: in development for ZECATHON 2026, on Zcash testnet. The spending key is a hot wallet on the server: fine for small testnet amounts; a production financier runs its node on its own infrastructure.
+
+## Who can see what (HNK-30.T10)
+- **Anyone:** `/node/info`, `/node/health` and `/node/board` show only public values (financier key, mailbox, wallet address, contact card, the public board). Everything else needs a console session (passkey, the console's `Origin`).
+- **The relay operator:** for each message the mailbox it goes to, its sealed size and the time; never its content, type, sender or N. Timing can still link an offer to the board entry that follows it (no padding or batching yet).
+- **Whoever hosts the node (here Railway, and the provider in the managed model, D-43):** the whole `/data` volume, so `node.key` and the wallet with its age identity. That host can spend the wallet and sign as the financier; the passkey gate only guards the console path. This is why a production financier runs this same image on its own machine.
+- The full table is in the vault, *Threat Model*, "Relay dan node yang sudah dibangun".
