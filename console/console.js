@@ -108,6 +108,7 @@ async function render() {
   $("out").hidden = !session.signed_in;
   for (const e of document.querySelectorAll("[data-private]")) e.hidden = !session.signed_in;
   $("mail").hidden = !session.signed_in;
+  $("devices").hidden = !session.signed_in;
   if (session.signed_in) {
     $("lede").textContent = "This node's keys and wallet stay on the node.";
     $("mailbox").textContent = short(info.mailbox_id);
@@ -151,6 +152,23 @@ document.addEventListener("DOMContentLoaded", () => {
   $("host").textContent = location.host;
   $("go").addEventListener("click", signIn);
   $("mail-refresh").addEventListener("click", loadMail);
+  $("add-device").addEventListener("click", async () => {
+    try {
+      const r = await post("/node/console/devices/code");
+      $("invite-link").textContent = r.link;
+      $("invite").hidden = false;
+    } catch (e) {
+      $("mail-note").textContent = e.message;
+    }
+  });
+  $("copy-invite").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($("invite-link").textContent);
+      $("copy-invite").textContent = "Copied";
+    } catch {
+      getSelection().selectAllChildren($("invite-link"));
+    }
+  });
   $("out").addEventListener("click", async () => {
     await post("/node/console/logout").catch(() => {});
     await render();

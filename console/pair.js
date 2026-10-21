@@ -81,7 +81,17 @@ async function info() {
   }
 }
 
+// An invite link carries the code after "#": the fragment never reaches the server. Fill it in
+// and take it out of the address bar and history (HNK-26.T20).
+function codeFromLink() {
+  const code = decodeURIComponent(location.hash.slice(1)).trim();
+  if (!code) return;
+  $("code").value = code;
+  history.replaceState(null, "", location.pathname);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  codeFromLink();
   if (!window.PublicKeyCredential) {
     say("This browser has no passkeys. Open this page in a current browser.");
     $("go").disabled = true;

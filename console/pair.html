@@ -16,14 +16,14 @@
       <svg class="auth-logo" viewBox="0 0 100 100" aria-hidden="true"><circle class="ring" cx="50" cy="50" r="44"/><circle class="ring-fine" cx="50" cy="50" r="36"/><text class="kanji" x="50" y="67" text-anchor="middle">印</text></svg>
       <p class="auth-eyebrow">Financier node</p>
       <h1 class="auth-title" id="title">Pair a passkey with this console</h1>
-      <p class="auth-sub">The console opens only with a passkey paired here. A pairing code comes from the node itself, so only someone who runs the node can pair.</p>
+      <p class="auth-sub">The console opens only with a passkey paired here. Your node provider sends you an invite link with the code; a signed-in console makes codes for more devices.</p>
     </header>
 
     <form class="auth-form" id="pair" novalidate>
       <label class="auth-field">
         <span>Pairing code</span>
         <input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" inputmode="text" maxlength="24" placeholder="XXXX-XXXX-XXXX-XXXX" required aria-describedby="code-help">
-        <small id="code-help">Run <code>jitsuin-node pair</code> on the node. A code works once, for 15 minutes.</small>
+        <small id="code-help">Opened from an invite link? The code is already filled in. Otherwise type the code you were given.</small>
       </label>
       <button class="auth-button" id="go" type="submit">Create passkey</button>
       <p class="auth-msg" id="msg" role="status" aria-live="polite"></p>

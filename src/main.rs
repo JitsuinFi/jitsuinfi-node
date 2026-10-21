@@ -98,6 +98,7 @@ struct State {
     origin: Option<String>,
     mail: Arc<mail::Mail>,
     board: Arc<board::Board>,
+    data_dir: std::path::PathBuf,
 }
 
 impl State {
@@ -141,6 +142,27 @@ impl State {
             Some(t) if c.session(t) => Ok(()),
             _ => Err((StatusCode::UNAUTHORIZED, "sign in to the console first")),
         }
+    }
+}
+
+/// "Add a device": a one-time pairing code (15 minutes) and its invite link, from a signed-in
+/// console; no terminal (HNK-26.T20, D-43).
+async fn device_code(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    let origin = st.origin.clone().unwrap_or_default();
+    match console::new_code(&st.data_dir) {
+        Ok(code) => Json(json!({
+            "code": code,
+            "link": format!("{origin}/console/pair#{code}"),
+            "expires_in": console::CODE_TTL.as_secs(),
+        }))
+        .into_response(),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the node could not make a code",
+        ),
     }
 }
 
@@ -250,6 +272,7 @@ fn pair_status(e: &console::PairError) -> StatusCode {
         NoCode | Expired | Ceremony | LoginGone => StatusCode::GONE,
         NotPaired => StatusCode::CONFLICT,
         NotApproved => StatusCode::FORBIDDEN,
+        Locked => StatusCode::TOO_MANY_REQUESTS,
         Wrong | Rejected => StatusCode::FORBIDDEN,
         Full => StatusCode::CONFLICT,
         Store => StatusCode::INTERNAL_SERVER_ERROR,
@@ -431,6 +454,7 @@ fn app(st: State) -> Router {
         .route("/node/console/login/finish", post(login_finish))
         .route("/node/console/session", get(session))
         .route("/node/console/logout", post(logout))
+        .route("/node/console/devices/code", post(device_code))
         .route("/node/console/approve/start", post(approve_start))
         .route("/node/console/approve/finish", post(approve_finish))
         .route("/node/board", get(board_snapshot))
@@ -559,10 +583,15 @@ async fn main() {
                 .expect("bind PORT");
             println!("node listening on :{}", cfg.port);
             let console = cfg.node_origin.as_deref().and_then(|o| {
-                console::Console::new(o, &cfg.data_dir, node.keys.console_user())
-                    .map_err(|e| eprintln!("console off: {e}"))
-                    .ok()
-                    .map(Arc::new)
+                console::Console::new(
+                    o,
+                    &cfg.data_dir,
+                    node.keys.console_user(),
+                    cfg.setup_code.as_deref(),
+                )
+                .map_err(|e| eprintln!("console off: {e}"))
+                .ok()
+                .map(Arc::new)
             });
             if console.is_none() && cfg.node_origin.is_none() {
                 println!("console off: NODE_ORIGIN is not set");
@@ -576,6 +605,7 @@ async fn main() {
             );
             let st = State {
                 board,
+                data_dir: cfg.data_dir.clone(),
                 public: Arc::new(p),
                 console,
                 origin: cfg.node_origin.clone(),
