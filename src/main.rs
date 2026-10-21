@@ -882,14 +882,16 @@ async fn fund_close(
         let Ok(to) = message::unhex::<32>(&p.mailbox_pk) else {
             continue;
         };
-        let body = json!({
+        let mut body = json!({
             "period": plan.period,
             "units": p.payout.units,
             "amount_zat": p.payout.amount_zat,
             "nav": plan.nav,
             "txid": payout_txid,
-            "next_token": p.next.as_ref().map(|(t, _)| hex(t)),
         });
+        if let Some((t, _)) = &p.next {
+            body["next_token"] = hex(t).into();
+        }
         if send_fund(&st, "fund.payout", &to, body).await.is_err() {
             undelivered += 1;
         }
