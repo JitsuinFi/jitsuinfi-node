@@ -11,6 +11,7 @@ mod console;
 mod deals;
 mod directory;
 mod fund;
+mod history;
 mod keys;
 mod mail;
 mod mandate;
@@ -1111,6 +1112,48 @@ async fn expire_offers(st: &State) {
     }
 }
 
+/// HNK-26.T8: checks the buyer's `history.chain` for deal `n` against the latest board scan; once
+/// it passes, the deal carries the tag and the supplier gets the commitment opening with it.
+async fn buyer_history(
+    st: &State,
+    n: &str,
+    dir: &std::path::Path,
+    me: &[u8; 32],
+    accepted: &offer::Accepted,
+    flow: &mut jitsuin_flow::financier::Flow,
+    meta: &mut deals::Meta,
+) -> Result<(), String> {
+    let chains = mail_for(st, n, "history.chain").await;
+    let Some((_, h)) = chains.last() else {
+        return Ok(()); // still waiting for the buyer
+    };
+    let certs = history::read_chain(h, n)?;
+    let (records, settled, _) = st.board.scan().ok_or("waiting for the first board scan")?;
+    let own = st.financier.verifying_key().to_bytes();
+    let allow = history::allowlist(own).await;
+    let (tag, summary) = history::check(
+        &certs,
+        &flow.deal().invoice,
+        &own,
+        &mandate::PrivateMandate::load(&st.data_dir),
+        allow,
+        |pk| st.buyers.get(&hex(pk)).is_some(),
+        (&records, &settled),
+        (unix_now() / 86_400) as u32,
+    )?;
+    *flow = deals::with_history_tag(flow, tag)?;
+    deals::save_flow(dir, n, flow)?;
+    let t = hex(&tag);
+    let (bytes, to) = offer::opening_message(&st.financier, me, accepted, Some(&t), unix_now())?;
+    st.mail
+        .send(&to, &bytes)
+        .await
+        .map_err(|e| format!("the commitment opening did not reach the supplier: {e}"))?;
+    meta.history_tag = Some(t);
+    meta.history = Some(summary);
+    Ok(())
+}
+
 /// The financier as `jitsuin_flow` needs it: wallets, board address, server, key.
 async fn financier(st: &State) -> Result<jitsuin_flow::financier::Financier, String> {
     let known = st.board_address.read().unwrap().clone();
@@ -1164,6 +1207,11 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
     let me = message::unhex::<32>(&st.public.mailbox_pk)?;
     let accepted = offer::load(&dir, n).ok_or("the deal's terms are gone")?;
     meta.problem = None;
+    if meta.history_requested && meta.history_tag.is_none() {
+        if let Err(e) = buyer_history(st, n, &dir, &me, &accepted, &mut flow, &mut meta).await {
+            meta.problem = Some(e);
+        }
+    }
     for _ in 0..6 {
         let before = flow.state().name();
         let step: Result<(), String> = async {
@@ -1356,6 +1404,8 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["paid_zat"] = meta.paid_zat.into();
     v["settled_txid"] = meta.settled_txid.clone().into();
     v["bundle_sent"] = meta.bundle_sent.into();
+    v["history_requested"] = meta.history_requested.into();
+    v["history"] = meta.history.clone().into();
     v["problem"] = meta.problem.clone().into();
     if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
         let i = pay::Intent::of(flow);
@@ -1573,9 +1623,31 @@ async fn offer_accept(
             );
         }
     };
-    let sent = match offer::opening_message(&st.financier, &mailbox_pk, &a, now) {
-        Ok((bytes, to)) => st.mail.send(&to, &bytes).await.map_err(|e| e.to_string()),
-        Err(e) => Err(e),
+    // HNK-26.T8: when the private mandate asks for the buyer's history, the buyer is asked first;
+    // the commitment opening (with the history tag) follows once the history passes.
+    let ask_history = history::needed(&mandate::PrivateMandate::load(&st.data_dir));
+    let sent = if ask_history {
+        match a.buyer_mailbox_pk.as_deref().map(message::unhex::<32>) {
+            Some(Ok(buyer)) => {
+                let mut nonce = [0u8; 16];
+                rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+                match history::request_message(&st.financier, &mailbox_pk, &buyer, &a.n, nonce, now) {
+                    Ok(bytes) => st.mail.send(&buyer, &bytes).await.map(|_| ()).map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Err("your mandate asks for the buyer's history, but this offer does not name the buyer's mailbox".into()),
+        }
+    } else {
+        match offer::opening_message(&st.financier, &mailbox_pk, &a, None, now) {
+            Ok((bytes, to)) => st
+                .mail
+                .send(&to, &bytes)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        }
     };
     match sent {
         Ok(_) => {
@@ -1603,6 +1675,13 @@ async fn offer_accept(
                 &address,
                 &st.name().unwrap_or_default(),
             );
+            if ask_history {
+                let meta = deals::Meta {
+                    history_requested: true,
+                    ..Default::default()
+                };
+                let _ = deals::save_meta(&deals, &a.n, &meta);
+            }
             let st2 = st.clone();
             let n = a.n.clone();
             tokio::spawn(async move {
@@ -1615,7 +1694,7 @@ async fn offer_accept(
             offer::forget(&deals, &a.n);
             error(
                 StatusCode::BAD_GATEWAY,
-                &format!("the reply did not reach the supplier: {e}"),
+                &format!("the reply did not go out: {e}"),
             )
         }
     }

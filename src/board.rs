@@ -8,18 +8,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use jitsuin_board::{BoardRecord, Position};
+use jitsuin_board::{BoardRecord, Position, SettledRecord};
 use jitsuin_wallet::Devtool;
 use serde_json::{json, Value};
 
 /// How often the board is rescanned.
 pub const EVERY: Duration = Duration::from_secs(120);
 
+/// Register records, settled records, tip.
+pub type Scan = (Vec<BoardRecord>, Vec<SettledRecord>, u32);
+
 #[derive(Default)]
 pub struct Board {
     latest: RwLock<Option<Value>>,
-    /// The register entries of the latest scan and the chain tip then, for the deal flow.
-    records: RwLock<Option<(Vec<BoardRecord>, u32)>>,
+    /// The register and settled entries of the latest scan and the chain tip then, for the deal
+    /// flow and the buyer history check.
+    records: RwLock<Option<Scan>>,
     /// Held by every zcash-devtool call of this node (board scan, wallet sync, payments): the
     /// wallets are SQLite files that two processes must not open at once.
     pub chain: Mutex<()>,
@@ -34,10 +38,7 @@ fn now() -> u64 {
 
 /// One scan: entries (register and settled) in board order, as snapshot items, plus the register
 /// records and the tip.
-fn scan_once(
-    watch: &Devtool,
-    lightwalletd: &str,
-) -> Result<(Value, Vec<BoardRecord>, u32), String> {
+fn scan_once(watch: &Devtool, lightwalletd: &str) -> Result<(Value, Scan), String> {
     let report = jitsuin_board::scan(watch, lightwalletd).map_err(|e| e.to_string())?;
     let tip = jitsuin_board::lwd::latest_height(lightwalletd).map_err(|e| e.to_string())?;
     let item = |txid: &str, p: Position, memo: &[u8]| {
@@ -64,7 +65,7 @@ fn scan_once(
         "pending": report.pending,
         "entries": items.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
     });
-    Ok((snapshot, report.records, tip))
+    Ok((snapshot, (report.records, report.settled, tip)))
 }
 
 impl Board {
@@ -74,6 +75,15 @@ impl Board {
 
     /// Register records and tip of the latest scan.
     pub fn records(&self) -> Option<(Vec<BoardRecord>, u32)> {
+        self.records
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|(r, _, t)| (r.clone(), *t))
+    }
+
+    /// Register and settled records and tip of the latest scan.
+    pub fn scan(&self) -> Option<Scan> {
         self.records.read().unwrap().clone()
     }
 
@@ -87,8 +97,8 @@ impl Board {
             })
             .await;
             match scanned {
-                Ok(Ok((v, records, tip))) => {
-                    *self.records.write().unwrap() = Some((records, tip));
+                Ok(Ok((v, scan))) => {
+                    *self.records.write().unwrap() = Some(scan);
                     println!(
                         "board: {} entries up to block {}",
                         v["entries"].as_array().map_or(0, |a| a.len()),

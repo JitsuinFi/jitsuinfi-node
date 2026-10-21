@@ -218,17 +218,22 @@ pub fn opening_message(
     key: &SigningKey,
     my_mailbox_pk: &[u8; 32],
     a: &Accepted,
+    history_tag: Option<&str>,
     now: u64,
 ) -> Result<(Vec<u8>, [u8; 32]), String> {
     let to = unhex::<32>(&a.supplier_mailbox_pk)?;
     let n = unhex::<32>(&a.n)?;
     let (salt, _commitment) = commitment_opening(key, &n);
-    let body = json!({
+    let mut body = json!({
         "financier_pk": hex(&key.verifying_key().to_bytes()),
         "salt": hex(&salt),
         "discount": a.discount,
         "tenor": a.tenor,
     });
+    // HNK-26.T8: the tag of the buyer's certificate for this invoice, which the entry must carry
+    if let Some(t) = history_tag {
+        body["history_tag"] = t.into();
+    }
     let mut header = message::draft(
         "deal.commitment_opening",
         my_mailbox_pk,
@@ -357,7 +362,7 @@ mod tests {
 
         // The reply opens to the supplier and carries this financier's salt, signed.
         let fin = key(8);
-        let (bytes, to) = opening_message(&fin, &[4; 32], &a, 6).unwrap();
+        let (bytes, to) = opening_message(&fin, &[4; 32], &a, None, 6).unwrap();
         assert_eq!(to, [3; 32]);
         let m = message::decode(&bytes, &hex(&jitsuin_core::mailbox::mailbox_id(&to))).unwrap();
         let fin_pk = hex(&fin.verifying_key().to_bytes());
