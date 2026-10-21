@@ -97,6 +97,24 @@ struct Pairing {
 pub struct Stored {
     pub paired_at: u64,
     pub passkey: Passkey,
+    /// Console origin it was paired on (its `rp.id`); absent for passkeys paired before 2026-10-21.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Last sign-in or approval with it (seconds since the epoch).
+    #[serde(default)]
+    pub last_used: Option<u64>,
+}
+
+/// What the console shows of one paired passkey (no key material).
+#[derive(Serialize)]
+pub struct Device {
+    pub id: String,
+    pub paired_at: u64,
+    pub last_used: Option<u64>,
+    /// Paired on this console's origin; a passkey from another origin cannot sign in here.
+    pub usable: bool,
+    /// The passkey of this session.
+    pub current: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -114,6 +132,9 @@ pub enum PairError {
     NotApproved,
     /// Too many wrong setup-code tries; wait.
     Locked,
+    /// The session's own passkey.
+    OwnDevice,
+    NoDevice,
 }
 
 impl PairError {
@@ -128,6 +149,8 @@ impl PairError {
             PairError::Store => "the node could not save the passkey",
             PairError::NotPaired => "no passkey is paired with this console yet; pair one first",
             PairError::LoginGone => "this passkey request has expired or was already used; try again",
+            PairError::OwnDevice => "this is the passkey you signed in with; sign in with another one to remove it",
+            PairError::NoDevice => "no such passkey on this node",
             PairError::Locked => "too many wrong codes; wait 15 minutes and try again",
             PairError::NotApproved => "this payment has no passkey approval (or it expired, was used, or was for another payment)",
         }
@@ -136,6 +159,7 @@ impl PairError {
 
 pub struct Console {
     webauthn: Webauthn,
+    origin: String,
     /// SHA-256 of the provider's setup code (first passkey only).
     setup: Option<String>,
     /// Wrong setup-code tries, and the end of a lockout.
@@ -146,7 +170,7 @@ pub struct Console {
     ceremonies: Mutex<HashMap<String, (PasskeyRegistration, Instant)>>,
     logins: Mutex<HashMap<String, (PasskeyAuthentication, Instant)>>,
     /// SHA-256 of each session token, and when the session ends.
-    sessions: Mutex<HashMap<String, Instant>>,
+    sessions: Mutex<HashMap<String, (Instant, String)>>,
     /// Approval ceremonies: state, the intent hash shown to the operator, start time.
     approving: Mutex<HashMap<String, Approving>>,
     /// Granted approvals: intent hash and when granted; removed when used.
@@ -156,6 +180,10 @@ pub struct Console {
 
 /// An approval ceremony: its state, the intent hash shown, its start.
 type Approving = (PasskeyAuthentication, [u8; 32], Instant);
+
+fn cred_hex(id: &[u8]) -> String {
+    hex(id)
+}
 
 fn token_hash(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
@@ -207,6 +235,7 @@ impl Console {
             .map_err(|e| format!("NODE_ORIGIN: {e}"))?;
         Ok(Console {
             webauthn,
+            origin: origin.trim_end_matches('/').to_string(),
             setup: setup_code.map(code_hash),
             setup_fails: Mutex::new((0, None)),
             user: Uuid::from_bytes(user),
@@ -337,6 +366,8 @@ impl Console {
         stored.push(Stored {
             paired_at: now(),
             passkey,
+            origin: Some(self.origin.clone()),
+            last_used: None,
         });
         write_private(
             &self.credentials,
@@ -379,11 +410,11 @@ impl Console {
         if at.elapsed() >= LOGIN_TTL {
             return Err(PairError::LoginGone);
         }
-        self.verify_assertion(&state, credential)?;
+        let cred = self.verify_assertion(&state, credential)?;
         let token = random_hex::<32>();
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.retain(|_, end| *end > Instant::now());
-        sessions.insert(token_hash(&token), Instant::now() + SESSION_TTL);
+        sessions.retain(|_, (end, _)| *end > Instant::now());
+        sessions.insert(token_hash(&token), (Instant::now() + SESSION_TTL, cred));
         Ok(token)
     }
 
@@ -393,7 +424,7 @@ impl Console {
             .lock()
             .unwrap()
             .get(&token_hash(token))
-            .is_some_and(|end| *end > Instant::now())
+            .is_some_and(|(end, _)| *end > Instant::now())
     }
 
     pub fn logout(&self, token: &str) {
@@ -405,7 +436,7 @@ impl Console {
         &self,
         state: &PasskeyAuthentication,
         credential: &PublicKeyCredential,
-    ) -> Result<(), PairError> {
+    ) -> Result<String, PairError> {
         let result = self
             .webauthn
             .finish_passkey_authentication(credential, state)
@@ -413,20 +444,70 @@ impl Console {
         if !result.user_verified() {
             return Err(PairError::Rejected);
         }
+        let used = cred_hex(result.cred_id());
         let _g = self.lock.lock().unwrap();
         let mut stored = self.stored();
-        let mut changed = false;
         for s in &mut stored {
-            changed |= s.passkey.update_credential(&result) == Some(true);
+            s.passkey.update_credential(&result);
+            if cred_hex(s.passkey.cred_id()) == used {
+                s.last_used = Some(now());
+            }
         }
-        if changed {
-            write_private(
-                &self.credentials,
-                &serde_json::to_vec(&stored).expect("json"),
-            )
-            .map_err(|_| PairError::Store)?;
+        write_private(
+            &self.credentials,
+            &serde_json::to_vec(&stored).expect("json"),
+        )
+        .map_err(|_| PairError::Store)?;
+        Ok(used)
+    }
+
+    /// The paired passkeys, for the signed-in session `token`.
+    pub fn devices(&self, token: &str) -> Vec<Device> {
+        let current = self.session_credential(token);
+        self.stored()
+            .iter()
+            .map(|s| {
+                let id = cred_hex(s.passkey.cred_id());
+                Device {
+                    current: current.as_deref() == Some(id.as_str()),
+                    usable: s.origin.as_deref() == Some(self.origin.as_str()),
+                    paired_at: s.paired_at,
+                    last_used: s.last_used,
+                    id,
+                }
+            })
+            .collect()
+    }
+
+    fn session_credential(&self, token: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&token_hash(token))
+            .filter(|(end, _)| *end > Instant::now())
+            .map(|(_, c)| c.clone())
+    }
+
+    /// Removes a paired passkey. The passkey of the session itself cannot be removed (sign in
+    /// with another one to do that), so a stolen session cannot lock the owner out of its own
+    /// device, and the last passkey always stays.
+    pub fn remove_device(&self, token: &str, id: &str) -> Result<usize, PairError> {
+        if self.session_credential(token).as_deref() == Some(id) {
+            return Err(PairError::OwnDevice);
         }
-        Ok(())
+        let _g = self.lock.lock().unwrap();
+        let mut stored = self.stored();
+        let before = stored.len();
+        stored.retain(|s| cred_hex(s.passkey.cred_id()) != id);
+        if stored.len() == before {
+            return Err(PairError::NoDevice);
+        }
+        write_private(
+            &self.credentials,
+            &serde_json::to_vec(&stored).expect("json"),
+        )
+        .map_err(|_| PairError::Store)?;
+        Ok(stored.len())
     }
 
     /// Starts a passkey approval of one payment (its intent hash, see `pay::Intent`).
@@ -597,6 +678,26 @@ mod tests {
         assert!(c.setup_matches(setup, false).unwrap());
         assert!(!c.setup_matches(setup, true).unwrap());
         assert_eq!(c.start("ANY").unwrap_err(), PairError::Wrong);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn devices_without_a_session_list_nothing_current_and_unknown_ids_are_refused() {
+        let d = dir("devices");
+        let c = Console::new("http://localhost:8788", &d, [1; 16], None).unwrap();
+        assert!(c.devices("no-session").is_empty());
+        assert_eq!(
+            c.remove_device("no-session", "abcd").unwrap_err(),
+            PairError::NoDevice
+        );
+        // a legacy record (no origin, no last use) still reads
+        let legacy: Vec<serde_json::Value> = vec![];
+        fs::write(
+            d.join("console-credentials.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert!(c.stored().is_empty());
         fs::remove_dir_all(&d).unwrap();
     }
 
