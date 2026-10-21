@@ -356,6 +356,9 @@ async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
                 };
                 if h["type"] == "deal.offer" {
                     let mut o = offer::summary(&h, &deals);
+                    if let Some(sent) = h["sent_at"].as_u64() {
+                        o["expires_at"] = (sent.min(unix_now()) + OFFER_TTL_SECS).into();
+                    }
                     if o["ok"] == true {
                         let b = o["n"]
                             .as_str()
@@ -1037,37 +1040,75 @@ async fn offer_decline(
         "" => "The financier declined this offer.".to_string(),
         r => r.to_string(),
     };
-    let (Ok(me), Some(Ok(to))) = (
-        message::unhex::<32>(&st.public.mailbox_pk),
-        h["from"]["mailbox_pk"].as_str().map(message::unhex::<32>),
-    ) else {
-        return error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "the offer has no reply mailbox",
-        );
-    };
+    if let Err(e) = send_decline(&st, &id, &h, &o.n, &reason).await {
+        return error(StatusCode::BAD_GATEWAY, &e);
+    }
+    Json(json!({ "ok": true, "reason": reason })).into_response()
+}
+
+/// Sends a signed `deal.decline` for the offer `id` (header `h`, invoice `n`) and removes it.
+async fn send_decline(
+    st: &State,
+    id: &str,
+    h: &Value,
+    n: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let me = message::unhex::<32>(&st.public.mailbox_pk)?;
+    let to = h["from"]["mailbox_pk"]
+        .as_str()
+        .ok_or("the offer has no reply mailbox")
+        .and_then(|p| message::unhex::<32>(p).map_err(|_| "the offer has no reply mailbox"))?;
     let mut d = message::draft(
         "deal.decline",
         &me,
         &to,
-        Some(&o.n),
+        Some(n),
         json!({ "reason": reason }),
         &[],
         unix_now(),
     );
     message::sign(&mut d, &st.financier);
-    let bytes = match message::encode(&d, &[]) {
-        Ok(b) => b,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    let bytes = message::encode(&d, &[])?;
+    st.mail
+        .send(&to, &bytes)
+        .await
+        .map_err(|e| format!("the decline did not reach the supplier: {e}"))?;
+    let _ = st.mail.remove(id).await;
+    Ok(())
+}
+
+/// Offers left unanswered this long expire (HNK-26.T6): the supplier hears so and may go to
+/// another financier.
+const OFFER_TTL_SECS: u64 = 7 * 86_400;
+
+/// Declines every offer older than `OFFER_TTL_SECS` that was not accepted.
+async fn expire_offers(st: &State) {
+    let Ok((list, _)) = st.mail.list().await else {
+        return;
     };
-    if let Err(e) = st.mail.send(&to, &bytes).await {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            &format!("the decline did not reach the supplier: {e}"),
-        );
+    let deals = st.data_dir.join(DEALS_DIR);
+    let now = unix_now();
+    for m in list {
+        let Some(id) = m["relay_id"].as_str() else {
+            continue;
+        };
+        let Some(h) = st.mail.header(id) else {
+            continue;
+        };
+        if h["type"] != "deal.offer" {
+            continue;
+        }
+        let sent = h["sent_at"].as_u64().unwrap_or(now).min(now);
+        let Ok(o) = offer::read(&h) else { continue };
+        if now - sent < OFFER_TTL_SECS || offer::load(&deals, &o.n).is_some() {
+            continue;
+        }
+        let r = "This offer expired: the financier did not answer within 7 days.";
+        if let Err(e) = send_decline(st, id, &h, &o.n, r).await {
+            eprintln!("offer {}…: {e}", &o.n[..8]);
+        }
     }
-    let _ = st.mail.remove(&id).await;
-    Json(json!({ "ok": true, "reason": reason })).into_response()
 }
 
 /// The financier as `jitsuin_flow` needs it: wallets, board address, server, key.
@@ -1327,6 +1368,9 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
 async fn drive_all(st: State) {
     loop {
         tokio::time::sleep(board::EVERY).await;
+        if st.console.as_ref().is_some_and(|c| !c.demo) {
+            expire_offers(&st).await;
+        }
         let dir = st.data_dir.join(DEALS_DIR);
         for n in deals::list(&dir) {
             if let Err(e) = drive(&st, &n).await {
