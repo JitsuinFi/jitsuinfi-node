@@ -373,6 +373,45 @@ pub fn bundle(
     b.to_bytes().map_err(|e| e.to_string())
 }
 
+/// The financier's seal s2 on the letter (index 2), from the kept seals of the supplier and the
+/// buyer: the same seal that went out with the advance (Ed25519 is deterministic).
+pub fn financier_seal(flow: &Flow, seals: &[String], key: &SigningKey) -> Result<Seal, String> {
+    let chain: Vec<Seal> = seals
+        .iter()
+        .map(|s| {
+            URL_SAFE_NO_PAD
+                .decode(s)
+                .ok()
+                .and_then(|b| Seal::from_bytes(&b).ok())
+                .ok_or_else(|| "a kept seal does not decode".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    flow.deal()
+        .assignment
+        .seal_next(key, &chain)
+        .map_err(|e| e.to_string())
+}
+
+/// `deal.seal` index 2 to `to`: the letter is complete, the buyer knows whom it pays.
+pub fn seal_message(
+    me: &[u8; 32],
+    to: &[u8; 32],
+    n: &str,
+    seal: &Seal,
+    now: u64,
+) -> Result<Vec<u8>, String> {
+    let h = message::draft(
+        "deal.seal",
+        me,
+        to,
+        Some(n),
+        json!({ "seal": URL_SAFE_NO_PAD.encode(seal.to_bytes()), "index": 2 }),
+        &[],
+        now,
+    );
+    message::encode(&h, &[])
+}
+
 /// `deal.bundle` to `to`.
 pub fn bundle_message(
     key: &SigningKey,

@@ -1425,6 +1425,18 @@ async fn deal_pay(
             {
                 meta.advance_sent = st.mail.send(&to, &bytes).await.is_ok();
             }
+            // HNK-25.T4: the financier's seal completes the letter; the buyer pays only then
+            if let Ok(s2) = deals::financier_seal(&flow, &meta.seals, &st.financier) {
+                let buyer = a
+                    .buyer_mailbox_pk
+                    .as_deref()
+                    .and_then(|b| message::unhex::<32>(b).ok());
+                for t in [Some(to), buyer].into_iter().flatten() {
+                    if let Ok(m) = deals::seal_message(&me, &t, &n, &s2, unix_now()) {
+                        let _ = st.mail.send(&t, &m).await;
+                    }
+                }
+            }
         }
     }
     let _ = deals::save_meta(&dir, &n, &meta);
