@@ -166,6 +166,35 @@ async fn device_code(AxState(st): AxState<State>, headers: HeaderMap) -> Respons
     }
 }
 
+/// The paired passkeys: when paired, last used, usable on this origin, the session's own.
+async fn devices_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    let c = st.console.as_deref().expect("signed in implies a console");
+    let token = session_token(&headers).unwrap_or_default();
+    Json(json!({ "devices": c.devices(token) })).into_response()
+}
+
+/// Removes a paired passkey (never the session's own).
+async fn device_remove(
+    AxState(st): AxState<State>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, true) {
+        return error(status, msg);
+    }
+    let c = st.console.as_deref().expect("signed in implies a console");
+    match c.remove_device(session_token(&headers).unwrap_or_default(), &id) {
+        Ok(n) => {
+            println!("console: passkey removed ({n} kept)");
+            Json(json!({ "ok": true, "kept": n })).into_response()
+        }
+        Err(e) => error(pair_status(&e), e.message()),
+    }
+}
+
 /// Starts the passkey approval of one payment; the console shows the intent it approves.
 async fn approve_start(
     AxState(st): AxState<State>,
@@ -273,6 +302,8 @@ fn pair_status(e: &console::PairError) -> StatusCode {
         NotPaired => StatusCode::CONFLICT,
         NotApproved => StatusCode::FORBIDDEN,
         Locked => StatusCode::TOO_MANY_REQUESTS,
+        OwnDevice => StatusCode::CONFLICT,
+        NoDevice => StatusCode::NOT_FOUND,
         Wrong | Rejected => StatusCode::FORBIDDEN,
         Full => StatusCode::CONFLICT,
         Store => StatusCode::INTERNAL_SERVER_ERROR,
@@ -454,6 +485,8 @@ fn app(st: State) -> Router {
         .route("/node/console/login/finish", post(login_finish))
         .route("/node/console/session", get(session))
         .route("/node/console/logout", post(logout))
+        .route("/node/console/devices", get(devices_list))
+        .route("/node/console/devices/{id}", delete(device_remove))
         .route("/node/console/devices/code", post(device_code))
         .route("/node/console/approve/start", post(approve_start))
         .route("/node/console/approve/finish", post(approve_finish))
