@@ -30,6 +30,26 @@ pub struct PrivateMandate {
     pub min_buyer_history: Option<u32>,
     #[serde(default)]
     pub buyer_kyc: bool,
+    /// HNK-26.T9: share of a buyer's settled invoices paid on time, in percent (default 80).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_on_time_pct: Option<u32>,
+    /// Days after the due date before an unpaid invoice counts as a default (default 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_days: Option<u32>,
+    /// Financier keys whose settlements count in a buyer's history, besides this node and the
+    /// provider's directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_financiers: Vec<String>,
+}
+
+impl PrivateMandate {
+    pub fn on_time_pct(&self) -> u32 {
+        self.min_on_time_pct.unwrap_or(80)
+    }
+
+    pub fn grace(&self) -> u32 {
+        self.grace_days.unwrap_or(7)
+    }
 }
 
 impl PrivateMandate {
@@ -61,6 +81,20 @@ impl PrivateMandate {
         }
         if self.min_buyer_history.is_some_and(|k| k > 64) {
             return Err("a buyer history holds at most 64 invoices");
+        }
+        if self.min_on_time_pct.is_some_and(|p| p > 100) {
+            return Err("the on-time share is a percentage from 0 to 100");
+        }
+        if self.grace_days.is_some_and(|d| d > 365) {
+            return Err("the grace period is at most 365 days");
+        }
+        if self.trusted_financiers.len() > 100
+            || self
+                .trusted_financiers
+                .iter()
+                .any(|k| crate::message::unhex::<32>(k).is_err())
+        {
+            return Err("trusted financiers are keys of 64 hex characters, at most 100");
         }
         Ok(())
     }
@@ -195,6 +229,7 @@ mod tests {
             min_discount_bps: Some(200),
             min_buyer_history: Some(2),
             buyer_kyc: true,
+            ..Default::default()
         };
         assert!(m.check().is_ok());
         let known = Buyer {
@@ -244,5 +279,20 @@ mod tests {
         }
         .check()
         .is_err());
+        // HNK-26.T9: policy values have ranges; trusted financiers are keys
+        assert!(PrivateMandate {
+            min_on_time_pct: Some(101),
+            ..Default::default()
+        }
+        .check()
+        .is_err());
+        assert!(PrivateMandate {
+            trusted_financiers: vec!["nothex".into()],
+            ..Default::default()
+        }
+        .check()
+        .is_err());
+        let p = PrivateMandate::default();
+        assert_eq!((p.on_time_pct(), p.grace()), (80, 7));
     }
 }

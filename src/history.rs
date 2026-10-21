@@ -24,20 +24,19 @@ use crate::message::{self, hex, unhex};
 pub const PROVIDER_SIGNER_PK: &str =
     "48eebdb1265d23d0a93bc563b875a6b5440a0e6567db3b91ad7f80a437ded4ec";
 pub const DIRECTORY_URL: &str = "https://jitsuinfi.vercel.app/directory.json";
-pub const GRACE_DAYS: u32 = 7;
 
 /// Whether the mandate asks for the buyer's history before an offer goes ahead.
 pub fn needed(m: &PrivateMandate) -> bool {
     m.min_buyer_history.is_some() || m.buyer_kyc
 }
 
-/// The minimum standard from the private mandate: no default ever, at least 80 % on time once
+/// The minimum standard from the private mandate: no default ever, at least the on-time share once
 /// established; with a history rule, a buyer is established after that many settled invoices and
 /// a new buyer is refused, otherwise a new buyer is welcome.
 pub fn standard(m: &PrivateMandate) -> MinimumStandard {
     MinimumStandard {
         max_defaults: 0,
-        min_on_time_pct: 80,
+        min_on_time_pct: m.on_time_pct(),
         established_after: m.min_buyer_history.unwrap_or(1),
         new_buyer_limit_zat: if m.min_buyer_history.is_some_and(|k| k > 0) {
             0
@@ -49,8 +48,15 @@ pub fn standard(m: &PrivateMandate) -> MinimumStandard {
 
 /// This node's key plus the keys of the provider's signed directory; only this node's key when
 /// the directory cannot be read or its signature does not hold.
-pub async fn allowlist(own: [u8; 32]) -> Vec<[u8; 32]> {
+pub async fn allowlist(own: [u8; 32], trusted: &[String]) -> Vec<[u8; 32]> {
     let mut keys = vec![own];
+    for k in trusted {
+        if let Ok(pk) = unhex::<32>(k) {
+            if !keys.contains(&pk) {
+                keys.push(pk);
+            }
+        }
+    }
     let url = std::env::var("DIRECTORY_URL").unwrap_or_else(|_| DIRECTORY_URL.into());
     let signer = std::env::var("PROVIDER_SIGNER_PK").unwrap_or_else(|_| PROVIDER_SIGNER_PK.into());
     let Ok(resp) = reqwest::get(&url).await else {
@@ -150,7 +156,7 @@ pub fn check(
     let policy = HistoryPolicy {
         allowlist,
         standard: standard(mandate),
-        grace_days: GRACE_DAYS,
+        grace_days: mandate.grace(),
     };
     let (report, tag) = check_buyer(
         earlier,
