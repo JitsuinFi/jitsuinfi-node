@@ -59,6 +59,13 @@ pub struct Meta {
     pub seals: Vec<String>,
     #[serde(default)]
     pub bundle_sent: bool,
+    /// HNK-26.T8: the buyer's history was asked for; its tag and what the check found.
+    #[serde(default)]
+    pub history_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<String>,
     /// The last thing that went wrong, shown in the console.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -285,6 +292,17 @@ pub fn start(
     write_atomic(&pdf_path(dir, &a.n), &pdf).map_err(|e| e.to_string())?;
     save_flow(dir, &a.n, &flow)?;
     Ok(flow)
+}
+
+/// The same deal with the buyer's history tag (HNK-26.T8): the register entry must carry it. Only
+/// before the supplier signed: the flow starts over at the board check.
+pub fn with_history_tag(flow: &Flow, tag: [u8; 32]) -> Result<Flow, String> {
+    if !matches!(flow.state(), State::Check | State::AwaitSupplierSignature) {
+        return Err("the supplier already signed the entry".into());
+    }
+    let mut deal = flow.deal().clone();
+    deal.history_tag = Some(tag);
+    Flow::new(deal).map_err(|e| e.to_string())
 }
 
 /// The supplier's signed board entry from a `deal.entry` for N.
