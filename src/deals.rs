@@ -225,6 +225,34 @@ pub fn letter_pdf(
     pdf(&l)
 }
 
+/// HNK-26.T17: a fresh shielded address of the node's wallet (a new diversifier, Orchard only),
+/// so the buyers of different deals do not pay one address that links them. Offline: no server.
+pub fn new_address(devtool: &Path, wallet_dir: &Path) -> Result<String, String> {
+    let out = std::process::Command::new(devtool)
+        .arg("wallet")
+        .arg("-w")
+        .arg(wallet_dir)
+        .args(["generate-address", "--pool", "orchard"])
+        .output()
+        .map_err(|e| format!("cannot run zcash-devtool: {e}"))?;
+    if !out.status.success() {
+        return Err("zcash-devtool could not make a new address".into());
+    }
+    parse_new_address(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_new_address(stdout: &str) -> Result<String, String> {
+    stdout
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("Address:")
+                .map(|a| a.trim().to_string())
+        })
+        .filter(|a| !a.is_empty() && a.len() <= 512 && a.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .ok_or_else(|| "no address in zcash-devtool's output".into())
+}
+
 /// Builds the deal and its flow from the accepted terms; the letter's PDF goes to `dir`.
 pub fn start(
     dir: &Path,
@@ -559,5 +587,13 @@ mod tests {
         let s = json!({ "type": "deal.seal", "n": "aa", "body": { "seal": "AAAA", "index": 0 } });
         assert!(read_seal(&s, "aa").unwrap_err().contains("not a seal"));
         assert!(read_seal(&s, "bb").is_err());
+    }
+
+    #[test]
+    fn a_new_address_is_read_from_devtool_output() {
+        let out = "Account AccountUuid(4c9a)\n     Address: utest1abc123\nZcash address\n - Network: testnet\n";
+        assert_eq!(parse_new_address(out).unwrap(), "utest1abc123");
+        assert!(parse_new_address("nothing here").is_err());
+        assert!(parse_new_address("Address: utest1 with spaces").is_err());
     }
 }
