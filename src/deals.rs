@@ -47,6 +47,18 @@ pub struct Meta {
     pub letter_sent: bool,
     #[serde(default)]
     pub advance_sent: bool,
+    /// HNK-26.T11–T12: the repayment as the wallet sees it, and the `settled` entry once posted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repayment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_zat: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_txid: Option<String>,
+    /// The supplier's and the buyer's seals (base64url), kept for the bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seals: Vec<String>,
+    #[serde(default)]
+    pub bundle_sent: bool,
     /// The last thing that went wrong, shown in the console.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -328,6 +340,100 @@ pub fn advance_message(
     message::encode(&h, &[])
 }
 
+/// HNK-26.T18: the verification bundle (JTSB) of a settled deal: the invoice and the buyer's
+/// signature, the letter with all three seals (the financier's is recomputed: Ed25519 is
+/// deterministic, so it is the seal that travelled with the advance), and the settlement document.
+pub fn bundle(
+    flow: &Flow,
+    buyer_signature: &str,
+    seals: &[String],
+    key: &SigningKey,
+) -> Result<Vec<u8>, String> {
+    let mut chain: Vec<Seal> = seals
+        .iter()
+        .map(|s| {
+            URL_SAFE_NO_PAD
+                .decode(s)
+                .ok()
+                .and_then(|b| Seal::from_bytes(&b).ok())
+                .ok_or_else(|| "a kept seal does not decode".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let a = &flow.deal().assignment;
+    chain.push(a.seal_next(key, &chain).map_err(|e| e.to_string())?);
+    let b = jitsuin_core::Bundle {
+        invoice: flow.deal().invoice.clone(),
+        buyer_signature: unhex::<64>(buyer_signature)?,
+        assignment: Some(a.clone()),
+        assignment_seals: chain,
+        settlement: Some(jitsuin_core::SettlementDoc::for_assignment(a)),
+    };
+    b.verify()
+        .map_err(|e| format!("the bundle does not verify: {e}"))?;
+    b.to_bytes().map_err(|e| e.to_string())
+}
+
+/// The financier's seal s2 on the letter (index 2), from the kept seals of the supplier and the
+/// buyer: the same seal that went out with the advance (Ed25519 is deterministic).
+pub fn financier_seal(flow: &Flow, seals: &[String], key: &SigningKey) -> Result<Seal, String> {
+    let chain: Vec<Seal> = seals
+        .iter()
+        .map(|s| {
+            URL_SAFE_NO_PAD
+                .decode(s)
+                .ok()
+                .and_then(|b| Seal::from_bytes(&b).ok())
+                .ok_or_else(|| "a kept seal does not decode".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    flow.deal()
+        .assignment
+        .seal_next(key, &chain)
+        .map_err(|e| e.to_string())
+}
+
+/// `deal.seal` index 2 to `to`: the letter is complete, the buyer knows whom it pays.
+pub fn seal_message(
+    me: &[u8; 32],
+    to: &[u8; 32],
+    n: &str,
+    seal: &Seal,
+    now: u64,
+) -> Result<Vec<u8>, String> {
+    let h = message::draft(
+        "deal.seal",
+        me,
+        to,
+        Some(n),
+        json!({ "seal": URL_SAFE_NO_PAD.encode(seal.to_bytes()), "index": 2 }),
+        &[],
+        now,
+    );
+    message::encode(&h, &[])
+}
+
+/// `deal.bundle` to `to`.
+pub fn bundle_message(
+    key: &SigningKey,
+    me: &[u8; 32],
+    to: &[u8; 32],
+    n: &str,
+    bundle: &[u8],
+    now: u64,
+) -> Result<Vec<u8>, String> {
+    let mut h = message::draft(
+        "deal.bundle",
+        me,
+        to,
+        Some(n),
+        json!({ "bundle": URL_SAFE_NO_PAD.encode(bundle) }),
+        &[],
+        now,
+    );
+    message::sign(&mut h, key);
+    message::encode(&h, &[])
+}
+
 /// What the console shows of a deal's state.
 pub fn view(flow: &Flow) -> Value {
     let s = flow.state();
@@ -428,6 +534,19 @@ mod tests {
             &m.header,
             Some(&hex(&fin.verifying_key().to_bytes()))
         ));
+
+        // HNK-26.T18: the supplier and the buyer seal, the bundle adds the financier's seal
+        let letter = &f.deal().assignment;
+        let s0 = letter.seal_next(&supplier, &[]).unwrap();
+        let s1 = letter.seal_next(&buyer, std::slice::from_ref(&s0)).unwrap();
+        let kept: Vec<String> = [s0, s1]
+            .iter()
+            .map(|s| URL_SAFE_NO_PAD.encode(s.to_bytes()))
+            .collect();
+        let b = bundle(&f, &a.buyer_signature, &kept, &fin).unwrap();
+        let back = jitsuin_core::Bundle::from_bytes(&b).unwrap();
+        assert_eq!(back.assignment_seals.len(), 3);
+        assert!(bundle(&f, &a.buyer_signature, &kept[..1], &fin).is_err());
     }
 
     #[test]
