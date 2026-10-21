@@ -4,6 +4,7 @@
 //!
 //! Runs behind Railway's HTTPS edge, which forwards plain HTTP to PORT inside the container.
 
+mod board;
 mod config;
 mod console;
 mod keys;
@@ -95,6 +96,7 @@ struct State {
     console: Option<Arc<console::Console>>,
     origin: Option<String>,
     mail: Arc<mail::Mail>,
+    board: Arc<board::Board>,
 }
 
 impl State {
@@ -338,6 +340,17 @@ async fn logout(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+/// The board as the node last scanned it (public data: anyone holding the board UFVK sees it).
+async fn board_snapshot(AxState(st): AxState<State>) -> Response {
+    match st.board.latest() {
+        Some(v) => Json(v).into_response(),
+        None => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the node is still scanning the board",
+        ),
+    }
+}
+
 async fn console_file(Path(path): Path<String>) -> Response {
     match asset(&path) {
         Some((mime, bytes)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
@@ -373,6 +386,7 @@ fn app(st: State) -> Router {
         .route("/node/console/login/finish", post(login_finish))
         .route("/node/console/session", get(session))
         .route("/node/console/logout", post(logout))
+        .route("/node/board", get(board_snapshot))
         .route("/node/mail", get(mail_list))
         .route("/node/mail/{id}", delete(mail_remove))
         .route("/node/mail/{id}/attachments/{index}", get(mail_attachment))
@@ -507,7 +521,14 @@ async fn main() {
                 println!("console off: NODE_ORIGIN is not set");
             }
             let relay = relay::Relay::new(&cfg.relay_url).unwrap_or_else(|e| fail(e));
+            let board = Arc::new(board::Board::default());
+            tokio::spawn(
+                board
+                    .clone()
+                    .run(node.board_watch.clone(), cfg.lightwalletd.clone()),
+            );
             let st = State {
+                board,
                 public: Arc::new(p),
                 console,
                 origin: cfg.node_origin.clone(),
