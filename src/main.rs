@@ -1130,12 +1130,13 @@ async fn buyer_history(
     let certs = history::read_chain(h, n)?;
     let (records, settled, _) = st.board.scan().ok_or("waiting for the first board scan")?;
     let own = st.financier.verifying_key().to_bytes();
-    let allow = history::allowlist(own).await;
+    let m = mandate::PrivateMandate::load(&st.data_dir);
+    let allow = history::allowlist(own, &m.trusted_financiers).await;
     let (tag, summary) = history::check(
         &certs,
         &flow.deal().invoice,
         &own,
-        &mandate::PrivateMandate::load(&st.data_dir),
+        &m,
         allow,
         |pk| st.buyers.get(&hex(pk)).is_some(),
         (&records, &settled),
@@ -1331,10 +1332,11 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                     let doc = jitsuin_core::SettlementDoc::for_assignment(&flow.deal().assignment);
                     let buyer = flow.deal().invoice.buyer_pk;
                     let today = (unix_now() / 86_400) as u32;
+                    let grace = mandate::PrivateMandate::load(&st.data_dir).grace();
                     let (status, paid, posted) = tokio::task::spawn_blocking(move || {
                         let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
                         let r = fin.repayment(&doc, &buyer).map_err(|e| e.to_string())?;
-                        let status = r.status(&doc, today, GRACE_DAYS);
+                        let status = r.status(&doc, today, grace);
                         let posted = if status == jitsuin_flow::settlement::Status::Settled {
                             Some(
                                 fin.post_settled(&doc, &buyer, &r)
