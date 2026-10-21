@@ -1,0 +1,34 @@
+name: retry deploy
+
+# Railway can pause deploys for hours (outage of 2026-10-21). Every hour this re-runs the failed
+# jobs of the newest `ci` run on main, which builds and deploys main, until one succeeds. Nothing
+# runs while the newest run is in progress or already succeeded.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retry:
+    name: re-run the newest main deploy if it failed
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --limit 1 --json databaseId,status,conclusion,headSha)
+          id=$(echo "$run" | jq -r '.[0].databaseId')
+          status=$(echo "$run" | jq -r '.[0].status')
+          conclusion=$(echo "$run" | jq -r '.[0].conclusion')
+          sha=$(echo "$run" | jq -r '.[0].headSha')
+          echo "newest main run $id ($sha): $status $conclusion"
+          if [ "$id" = "null" ] || [ "$status" != "completed" ] || [ "$conclusion" = "success" ]; then
+            echo "nothing to do"
+            exit 0
+          fi
+          gh run rerun "$id" --failed -R "$GITHUB_REPOSITORY"
+          echo "re-ran the failed jobs of $id"
