@@ -1147,6 +1147,20 @@ async fn buyer_history(
     flow: &mut jitsuin_flow::financier::Flow,
     meta: &mut deals::Meta,
 ) -> Result<(), String> {
+    // BL-D26-06: the history passed before a crash (the tag is in the saved deal, the meta was not
+    // written yet): send the opening again with that tag, without a second check
+    if let Some(t) = deals::checked_tag(flow) {
+        let (bytes, to) =
+            offer::opening_message(&st.financier, me, accepted, Some(&t), unix_now())?;
+        st.mail
+            .send(&to, &bytes)
+            .await
+            .map_err(|e| format!("the commitment opening did not reach the supplier: {e}"))?;
+        meta.history_tag = Some(t);
+        meta.history
+            .get_or_insert_with(|| "passed before the node restarted".into());
+        return Ok(());
+    }
     let chains = mail_for(st, n, "history.chain").await;
     let Some((_, h)) = chains.last() else {
         return Ok(()); // still waiting for the buyer
