@@ -332,6 +332,12 @@ pub fn with_history_tag(flow: &Flow, tag: [u8; 32]) -> Result<Flow, String> {
     Flow::new(deal).map_err(|e| e.to_string())
 }
 
+/// BL-D26-06: the history tag already in the saved deal, when the buyer's history passed before a
+/// crash or restart; the retry sends it again instead of checking the history a second time.
+pub fn checked_tag(flow: &Flow) -> Option<String> {
+    flow.deal().history_tag.map(|t| hex(&t))
+}
+
 /// HNK-26.T14: the double-signature proof and Exhibit A of a deal stopped as double financed,
 /// both checked before they are kept; `None` in any other state.
 pub fn double_proof(
@@ -685,6 +691,14 @@ mod tests {
         assert_eq!(list(&dir), vec![n.clone()]);
         let back = load_flow(&dir, &n).unwrap();
         assert_eq!(back.nullifier(), f.nullifier());
+        // BL-D26-06: a passed history's tag survives a reload, so a retry does not check again
+        assert_eq!(checked_tag(&back), None);
+        save_flow(&dir, &n, &with_history_tag(&back, [9; 32]).unwrap()).unwrap();
+        assert_eq!(
+            checked_tag(&load_flow(&dir, &n).unwrap()),
+            Some(hex(&[9; 32]))
+        );
+        save_flow(&dir, &n, &back).unwrap();
         let pdf = std::fs::read(pdf_path(&dir, &n)).unwrap();
         assert_eq!(f.deal().assignment.terms_hash, document_hash(&pdf));
         let bytes = letter_message(&fin, &[8; 32], &[7; 32], &f, &pdf, 5).unwrap();
