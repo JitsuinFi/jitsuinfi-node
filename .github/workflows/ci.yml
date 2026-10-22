@@ -47,8 +47,9 @@ jobs:
     needs: [check, secrets]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    # A deploy may wait hours for Railway; a newer main cancels the older one still waiting.
-    timeout-minutes: 340
+    # Build and upload only; a paused Railway fails the job fast and "retry deploy" re-runs it
+    # later (minutes are billed while a job waits). A newer main cancels an older deploy.
+    timeout-minutes: 30
     concurrency:
       group: railway-deploy
       cancel-in-progress: true

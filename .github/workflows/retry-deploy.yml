@@ -1,11 +1,11 @@
 name: retry deploy
 
-# Railway can pause deploys for hours (outage of 2026-10-21). Every hour this re-runs the failed
-# jobs of the newest `ci` run on main, which builds and deploys main, until one succeeds. Nothing
-# runs while the newest run is in progress or already succeeded.
+# Railway can pause deploys for hours (outages of 2026-10-21 and 2026-10-22). Every six hours this
+# re-runs the failed jobs of the newest `ci` run on main, which builds and deploys main, until one
+# succeeds. Nothing runs while the newest run is in progress or already succeeded.
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 permissions:
