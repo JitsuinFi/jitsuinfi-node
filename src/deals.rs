@@ -81,6 +81,21 @@ pub struct Meta {
     /// The last thing that went wrong, shown in the console.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// HNK-32.T4 (BL-D23-14): confirmations of this node's entry at the last board check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_confirmations: Option<u32>,
+}
+
+/// Confirmations of the entry `txid` in a board lookup at `tip`: 0 while the board does not
+/// show it yet, none when another entry came first (the deal stops then).
+pub fn confirmations(lookup: &jitsuin_board::Lookup, tip: u32, txid: &str) -> Option<u32> {
+    use jitsuin_board::Lookup;
+    match lookup {
+        Lookup::NotFound { .. } => Some(0),
+        Lookup::Registered { winner, .. } | Lookup::DoubleFinanced { winner, .. } => (winner.txid
+            == txid)
+            .then(|| jitsuin_flow::financier::confirmations(tip, winner.position.height)),
+    }
 }
 
 pub fn load_meta(dir: &Path, n: &str) -> Meta {
@@ -552,12 +567,11 @@ mod tests {
     use super::*;
     use jitsuin_core::invoice::sign_invoice;
 
-    #[test]
-    fn a_stopped_deal_shows_a_code_and_the_entry_that_came_first() {
-        let winner = jitsuin_board::BoardRecord {
-            txid: "ab".repeat(32),
+    fn record(txid: &str, height: u32) -> jitsuin_board::BoardRecord {
+        jitsuin_board::BoardRecord {
+            txid: txid.into(),
             position: jitsuin_board::Position {
-                height: 7,
+                height,
                 tx_index: 0,
                 output_index: 0,
             },
@@ -570,7 +584,12 @@ mod tests {
                 history_tag: None,
                 supplier_sig: [3; 64],
             },
-        };
+        }
+    }
+
+    #[test]
+    fn a_stopped_deal_shows_a_code_and_the_entry_that_came_first() {
+        let winner = record(&"ab".repeat(32), 7);
         let mut v = json!({});
         stop_view(
             &Stop::AlreadyFinanced {
@@ -590,6 +609,22 @@ mod tests {
             &mut v,
         );
         assert_eq!(v["stopped"], "DoubleFinanced");
+    }
+
+    #[test]
+    fn confirmations_count_from_the_entry_height_to_the_tip() {
+        use jitsuin_board::Lookup;
+        let mine = Lookup::Registered {
+            winner: record("mine", 100),
+            ignored_invalid: vec![],
+        };
+        assert_eq!(confirmations(&mine, 100, "mine"), Some(1));
+        assert_eq!(confirmations(&mine, 102, "mine"), Some(3));
+        assert_eq!(confirmations(&mine, 102, "other"), None);
+        let none = Lookup::NotFound {
+            ignored_invalid: vec![],
+        };
+        assert_eq!(confirmations(&none, 102, "mine"), Some(0));
     }
 
     #[test]
