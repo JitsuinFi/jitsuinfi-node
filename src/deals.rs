@@ -21,7 +21,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use jitsuin_core::{commitment_opening, document_hash, Assignment, BoardEntry, Invoice, Seal};
-use jitsuin_flow::financier::{Deal, Flow, State};
+use jitsuin_flow::financier::{Deal, Flow, State, Stop};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -509,6 +509,17 @@ pub fn bundle_message(
     message::encode(&h, &[])
 }
 
+/// Why a deal stopped, as a code the console turns into a sentence (HNK-32.T3, BL-D23-08,
+/// BL-D27-01), with the txid of the entry that came first on the board.
+fn stop_view(stop: &Stop, v: &mut Value) {
+    let (code, winner) = match stop {
+        Stop::AlreadyFinanced { winner } => ("AlreadyFinanced", winner),
+        Stop::DoubleFinanced { winner, .. } => ("DoubleFinanced", winner),
+    };
+    v["stopped"] = code.into();
+    v["stopped_winner"] = winner.txid.clone().into();
+}
+
 /// What the console shows of a deal's state.
 pub fn view(flow: &Flow) -> Value {
     let s = flow.state();
@@ -530,7 +541,7 @@ pub fn view(flow: &Flow) -> Value {
             v["entry_txid"] = entry.txid.clone().into();
             v["advance_txid"] = advance_txid.clone().into();
         }
-        State::Stopped(stop) => v["stopped"] = format!("{stop:?}").into(),
+        State::Stopped(stop) => stop_view(stop, &mut v),
         _ => {}
     }
     v
@@ -540,6 +551,46 @@ pub fn view(flow: &Flow) -> Value {
 mod tests {
     use super::*;
     use jitsuin_core::invoice::sign_invoice;
+
+    #[test]
+    fn a_stopped_deal_shows_a_code_and_the_entry_that_came_first() {
+        let winner = jitsuin_board::BoardRecord {
+            txid: "ab".repeat(32),
+            position: jitsuin_board::Position {
+                height: 7,
+                tx_index: 0,
+                output_index: 0,
+            },
+            entry: BoardEntry {
+                kind: jitsuin_core::EntryKind::Register,
+                nullifier: [1; 32],
+                financier_commitment: [2; 32],
+                discount_bucket: 0,
+                tenor_bucket: 0,
+                history_tag: None,
+                supplier_sig: [3; 64],
+            },
+        };
+        let mut v = json!({});
+        stop_view(
+            &Stop::AlreadyFinanced {
+                winner: winner.clone(),
+            },
+            &mut v,
+        );
+        assert_eq!(
+            v,
+            json!({ "stopped": "AlreadyFinanced", "stopped_winner": "ab".repeat(32) })
+        );
+        stop_view(
+            &Stop::DoubleFinanced {
+                winner,
+                conflicting: vec![],
+            },
+            &mut v,
+        );
+        assert_eq!(v["stopped"], "DoubleFinanced");
+    }
 
     #[test]
     fn the_letter_pdf_is_stable_and_well_formed() {
