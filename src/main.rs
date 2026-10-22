@@ -1400,6 +1400,10 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                         &meta.seals,
                         &st.financier,
                     )?;
+                    meta.bundle = Some(base64::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        &bytes,
+                    ));
                     let mut to = vec![message::unhex::<32>(&accepted.supplier_mailbox_pk)?];
                     if let Some(b) = &accepted.buyer_mailbox_pk {
                         to.push(message::unhex::<32>(b)?);
@@ -1456,6 +1460,7 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["settled_txid"] = meta.settled_txid.clone().into();
     v["evidence"] = meta.evidence.clone().into();
     v["bundle_sent"] = meta.bundle_sent.into();
+    v["bundle"] = meta.bundle.clone().into();
     v["history_requested"] = meta.history_requested.into();
     v["proof"] = meta.proof.clone().into();
     v["exhibit"] = meta.exhibit.clone().into();
