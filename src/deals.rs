@@ -62,6 +62,9 @@ pub struct Meta {
     pub seals: Vec<String>,
     #[serde(default)]
     pub bundle_sent: bool,
+    /// The verification bundle (JTSB, base64url) once settled, for the console (BL-D28-03).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
     /// HNK-26.T14: when the board shows the invoice financed twice, the double-signature proof
     /// (JTSP) and Exhibit A (JTSX), base64url, for the Verify page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
