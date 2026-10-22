@@ -1251,6 +1251,9 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
                         flow.nullifier(),
                         &flow.deal().invoice.supplier_ephemeral_pk,
                     );
+                    if let S::AwaitConfirmation { entry_txid } = flow.state() {
+                        meta.entry_confirmations = deals::confirmations(&lookup, tip, entry_txid);
+                    }
                     flow.apply(Event::BoardChecked {
                         lookup,
                         tip_height: tip,
@@ -1466,6 +1469,8 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["exhibit"] = meta.exhibit.clone().into();
     v["history"] = meta.history.clone().into();
     v["problem"] = meta.problem.clone().into();
+    v["confirmations"] = meta.entry_confirmations.into();
+    v["min_confirmations"] = flow.deal().min_confirmations.into();
     if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
         let i = pay::Intent::of(flow);
         v["intent"] = json!({ "n": i.n, "amount_zat": i.amount_zat, "address": i.address });
