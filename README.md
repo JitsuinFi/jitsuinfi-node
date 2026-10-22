@@ -21,7 +21,7 @@ The node is managed by its provider; the financier only uses a browser and a pas
 The setup code pairs the first passkey only; once a passkey is paired it is refused, and five wrong tries lock it for 15 minutes. More devices: **Add a device** in a signed-in console gives a one-time invite link (15 minutes). `jitsuin-node pair` (Railway: `railway ssh --service financier-node jitsuin-node pair`) stays for the provider's recovery only.
 
 ## New financiers: apply, review, node (HNK-26.T25, D-46)
-A financier applies at `jitsuinfi.vercel.app/app.html#/apply`. The application (name, contact, note) is sealed to the provider's mailbox; the relay keeps ciphertext only. The provider, on its own machine:
+A financier applies at `jitsuinfi.vercel.app/apply`. The application (name, contact, note) is sealed to the provider's mailbox; the relay keeps ciphertext only. The provider, on its own machine:
 1. `jitsuin-node provider init` once: makes the provider key in `~/.jitsuin-provider` (0600; back it up) and prints the public mailbox and signing keys the web app carries (`src/lib/provider.ts`).
 2. `jitsuin-node provider inbox`: reads the applications. Review is manual (financier KYC is a later task, HNK-26.T27).
 3. `scripts/provision-node.sh <service> "<name>" <reply_mailbox_pk>`: makes the Railway service, volume and settings with a random `SETUP_CODE`, then sends the applicant a signed invite sealed to its mailbox. The console origin for a new node is added by hand (a Vercel project and a host rule), as the script says.
