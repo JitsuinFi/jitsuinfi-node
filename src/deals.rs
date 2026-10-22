@@ -651,6 +651,37 @@ mod tests {
         let (proof, exhibit) = double_proof(&stopped, &a.buyer_signature).unwrap().unwrap();
         assert!(!proof.is_empty() && !exhibit.is_empty());
         assert!(double_proof(&f, &a.buyer_signature).unwrap().is_none());
+
+        // BL-D23-07: a deal the terms cannot carry is refused with a sentence, nothing saved
+        let other = std::env::temp_dir().join(format!("jitsuin-deals-{}", message::random_id()));
+        std::fs::create_dir_all(&other).unwrap();
+        for (bad, why) in [
+            (
+                Accepted {
+                    min_confirmations: 0,
+                    ..a.clone()
+                },
+                "min_confirmations",
+            ),
+            (
+                Accepted {
+                    advance_zat: 0,
+                    ..a.clone()
+                },
+                "advance",
+            ),
+            (
+                Accepted {
+                    supplier_address: String::new(),
+                    ..a.clone()
+                },
+                "supplier address",
+            ),
+        ] {
+            let e = start(&other, &bad, &fin, "utest1financier", "Kurogane").unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+        assert!(list(&other).is_empty());
     }
 
     #[test]

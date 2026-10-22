@@ -62,6 +62,39 @@ CI builds `jitsuin-node` and zcash-devtool on ubuntu-24.04 (zcash-devtool cached
 
 Status: in development for ZECATHON 2026, on Zcash testnet. The spending key is a hot wallet on the server: fine for small testnet amounts; a production financier runs its node on its own infrastructure.
 
+## API (HNK-05.T3)
+
+The console (`/console/`) is the only client. "Session" means the console's signed-in cookie from a passkey sign-in; "write" routes also need the request's `Origin` to be `NODE_ORIGIN`. "Approval" means a fresh passkey assertion over the plan the console shows (`approve/start`, then `approve/finish`), so a stolen session cannot move funds. Errors are `{ "error": "<sentence for the financier>" }` with a 4xx or 5xx status.
+
+| Method | Path | Access | Body | Answer |
+|---|---|---|---|---|
+| GET | `/node/info` | public | | the node's public keys, wallet address, network |
+| GET | `/node/board` | public | | the latest board scan (entries and settled entries, tip height) |
+| POST | `/node/console/pair/start`, `/pair/finish` | pairing code | `code`; then `ceremony`, `credential` | passkey registration options; then the session |
+| POST | `/node/console/login/start`, `/login/finish` | public | none; then `ceremony`, `credential` | passkey sign-in options; then the session |
+| GET | `/node/console/session` | public | | `signed_in`, `paired`, `name`, `console`, `demo` |
+| POST | `/node/console/logout` | session | | `ok` |
+| POST | `/node/console/name` | session, write | `name` | `ok` |
+| GET, POST, DELETE | `/node/console/devices`, `/devices/code`, `/devices/{id}` | session (write for POST and DELETE) | | the passkeys; a one-time code to add a device; removal |
+| POST | `/node/console/approve/start`, `/approve/finish` | session, write | `plan`; then `ceremony`, `credential` | the assertion options; then the one-use `approval` token |
+| GET | `/node/mail` | session | | `messages` (offers, seals, history, fund mail), `refused` |
+| DELETE | `/node/mail/{id}` | session, write | | `ok` |
+| GET | `/node/mail/{id}/attachments/{index}` | session | | the attachment's bytes (the invoice PDF) |
+| POST | `/node/console/offers/{id}/accept` | session, write | `advance_zat`, `min_confirmations` | the new deal; asks the buyer's history first when the private mandate says so |
+| POST | `/node/console/offers/{id}/decline` | session, write | `reason` | `ok`; the supplier gets `deal.decline` |
+| GET | `/node/console/deals` | session | | `deals`: state, txids, seals, the next step per deal |
+| POST | `/node/console/deals/{n}/step` | session, write | | the deal after one step of `jitsuin-flow` |
+| POST | `/node/console/deals/{n}/pay` | session, write, approval | `approval` | the advance txid |
+| GET, POST | `/node/console/mandate`, `/mandate/private` | session (write for POST) | the mandate | the published and the private mandate |
+| GET, POST, DELETE | `/node/console/buyers`, `/buyers/{pk}` | session (write for POST and DELETE) | `identity_pk`, `label` | the KYC list of buyer identity keys |
+| POST | `/node/console/reputation` | session, write | | `deals`: the signed settlement history for the directory |
+| GET | `/node/console/fund` | session | | `nav`, `total_units`, `deposits`, `queue`, `leaves`, `closes`, `period` |
+| POST | `/node/console/fund/deposits`, `/fund/deposit-address` | session, write | `member`, `txid`; none | the member's units; a fresh deposit address |
+| POST | `/node/console/fund/withdrawals/{id}` | session, write | | `period`, `units`: the request joins the queue |
+| POST | `/node/console/fund/plan`, `/fund/close` | session, write; close needs approval | none; `plan_id`, `approval`, `next_token` | the period's payout plan; the payouts and `paid_zat` |
+
+A deal the terms cannot carry is refused before anything is saved: no advance, an advance above what the supplier asked, confirmations outside 1 to 100 (`offer::accept`), and `jitsuin_flow::Flow::new` checks again (advance, confirmations, supplier address, classes, a letter that belongs to this invoice).
+
 ## Who can see what (HNK-30.T10)
 - **Anyone:** `/node/info`, `/node/health` and `/node/board` show only public values (financier key, mailbox, wallet address, contact card, the public board). Everything else needs a console session (passkey, the console's `Origin`).
 - **The relay operator:** for each message the mailbox it goes to, its sealed size and the time; never its content, type, sender or N. Timing can still link an offer to the board entry that follows it (no padding or batching yet).
