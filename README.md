@@ -12,6 +12,10 @@ All in the data volume (`DATA_DIR`, `/data` on Railway), never in the repo, the 
 
 `jitsuin-node setup` makes what is missing (HNK-26.T1) and prints only public values; `serve` runs setup, registers the financier mailbox at the relay (HNK-26.T4), then serves `GET /node/health`, `GET /node/info` (financier key, mailbox id, wallet address, contact card) and the console. `jitsuin-node inbox` lists the messages in the mailbox.
 
+## Try it: the demo console (HNK-26.T26, D-46)
+
+<https://jitsuinfi-console-demo.vercel.app/console> runs this node with `DEMO=1` on its own testnet service: anyone creates a passkey without an invite and signs in as its financier. Approvals, devices, invites, names and deleting messages are off there, and only the 200 newest passkeys are kept.
+
 ## Onboarding a financier, no terminal (HNK-26.T20, D-43)
 The node is managed by its provider; the financier only uses a browser and a passkey.
 1. The provider sets the Railway variable `SETUP_CODE` to a random code (16+ letters or digits, e.g. from a password generator) on the financier's node. `NODE_ORIGIN` comes from `RAILWAY_PUBLIC_DOMAIN` by itself.
