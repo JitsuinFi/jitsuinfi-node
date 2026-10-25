@@ -84,6 +84,9 @@ pub struct Meta {
     /// HNK-32.T4 (BL-D23-14): confirmations of this node's entry at the last board check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_confirmations: Option<u32>,
+    /// buyer-late: the due-date reminders the buyer's mailbox got (`reminder::MILESTONES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reminders: Vec<String>,
 }
 
 impl Meta {
