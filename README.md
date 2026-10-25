@@ -81,21 +81,23 @@ The console (`/console/`) is the only client. "Session" means the console's sign
 | POST | `/node/console/name` | session, write | `name` | `ok` |
 | GET, POST, DELETE | `/node/console/devices`, `/devices/code`, `/devices/{id}` | session (write for POST and DELETE) | | the passkeys; a one-time code to add a device; removal |
 | POST | `/node/console/approve/start`, `/approve/finish` | session, write | `plan`; then `ceremony`, `credential` | the assertion options; then the one-use `approval` token |
-| GET | `/node/mail` | session | | `messages` (offers, seals, history, fund mail), `refused` |
+| GET | `/node/mail` | session | | `messages` (offers, seals, history, fund mail), `refused`; an accepted offer says where the commitment opening is (`opening`: `sent`, `awaiting_history`, `sent_after_history`) |
 | DELETE | `/node/mail/{id}` | session, write | | `ok` |
 | GET | `/node/mail/{id}/attachments/{index}` | session | | the attachment's bytes (the invoice PDF) |
 | POST | `/node/console/offers/{id}/accept` | session, write | `advance_zat`, `min_confirmations` | the new deal; asks the buyer's history first when the private mandate says so |
 | POST | `/node/console/offers/{id}/decline` | session, write | `reason` | `ok`; the supplier gets `deal.decline` |
-| GET | `/node/console/deals` | session | | `deals`: state, txids, seals, the next step per deal |
+| GET | `/node/console/deals` | session | | `deals`: state, txids, seals, the next step per deal; a stopped deal's `stopped`, `stopped_winner` and `stopped_order` (`ours_first`, `theirs_first`, `others_only`) |
 | POST | `/node/console/deals/{n}/step` | session, write | | the deal after one step of `jitsuin-flow` |
 | POST | `/node/console/deals/{n}/pay` | session, write, approval | `approval` | the advance txid |
 | GET, POST | `/node/console/mandate`, `/mandate/private` | session (write for POST) | the mandate | the published and the private mandate |
 | GET, POST, DELETE | `/node/console/buyers`, `/buyers/{pk}` | session (write for POST and DELETE) | `identity_pk`, `label` | the KYC list of buyer identity keys |
 | POST | `/node/console/reputation` | session, write | | `deals`: the signed settlement history for the directory |
-| GET | `/node/console/fund` | session | | `nav`, `total_units`, `deposits`, `queue`, `leaves`, `closes`, `period` |
+| GET | `/node/console/fund` | session | | `nav`, `total_units`, `deposits`, `queue`, `leaves`, `closes`, `period`, `books_since` |
 | POST | `/node/console/fund/deposits`, `/fund/deposit-address` | session, write | `member`, `txid`; none | the member's units; a fresh deposit address |
 | POST | `/node/console/fund/withdrawals/{id}` | session, write | | `period`, `units`: the request joins the queue |
-| POST | `/node/console/fund/plan`, `/fund/close` | session, write; close needs approval | none; `plan_id`, `approval`, `next_token` | the period's payout plan; the payouts and `paid_zat` |
+| POST | `/node/console/fund/plan`, `/fund/close` | session, write; close needs approval | none; `plan_id`, `approval`, `next_token` | the period's payout plan, valued on the fund's books (`cash_zat` the books' cash, `wallet_zat` the whole wallet); the payouts and `paid_zat` |
+
+The fund is valued on its books, not on the node's whole wallet (user decision 2026-10-25): the deposits recorded in `fund.json`, the advances the books' cash paid in full (in chain order) and their repayments, and the payouts (`jitsuin_flow::fund::fund_books`). Each member's `fund.merkle_path` carries the books' txids (`books`), so `jitsuin fund --path` reads the same values from the chain. A ledger closed before this change is repriced from the books at its last close before the next deposit or plan.
 
 A deal the terms cannot carry is refused before anything is saved: no advance, an advance above what the supplier asked, confirmations outside 1 to 100 (`offer::accept`), and `jitsuin_flow::Flow::new` checks again (advance, confirmations, supplier address, classes, a letter that belongs to this invoice).
 

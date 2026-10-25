@@ -936,7 +936,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jitsuin-board"
 version = "0.1.0"
-source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=46ecae134763410b6aae8152e963bce597a58da1#46ecae134763410b6aae8152e963bce597a58da1"
+source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c#c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c"
 dependencies = [
  "jitsuin-core",
  "jitsuin-wallet",
@@ -947,7 +947,7 @@ dependencies = [
 [[package]]
 name = "jitsuin-core"
 version = "0.1.0"
-source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=46ecae134763410b6aae8152e963bce597a58da1#46ecae134763410b6aae8152e963bce597a58da1"
+source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c#c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c"
 dependencies = [
  "blake2b_simd",
  "crypto_box",
@@ -959,7 +959,7 @@ dependencies = [
 [[package]]
 name = "jitsuin-flow"
 version = "0.1.0"
-source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=46ecae134763410b6aae8152e963bce597a58da1#46ecae134763410b6aae8152e963bce597a58da1"
+source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c#c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c"
 dependencies = [
  "ed25519-dalek",
  "jitsuin-board",
@@ -993,7 +993,7 @@ dependencies = [
 [[package]]
 name = "jitsuin-wallet"
 version = "0.1.0"
-source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=46ecae134763410b6aae8152e963bce597a58da1#46ecae134763410b6aae8152e963bce597a58da1"
+source = "git+https://github.com/JitsuinFi/jitsuinfi-zcash?rev=c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c#c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c"
 dependencies = [
  "base64 0.22.1",
 ]

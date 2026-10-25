@@ -3,9 +3,20 @@
 //! token (the member has no signing key, only a mailbox); the leaf id is the token's hash
 //! (`jitsuin_core::units`). A member asks to withdraw by opening the token in a sealed
 //! `fund.withdraw`; requests wait for the end of the period. Closing a period values the fund
-//! from the node's own wallet (cash plus receivables, as members compute it with `fund_view`),
-//! pays the queue from cash only (pro rata when cash is short, nothing while the fund is below
-//! par), signs the new unit tree's root into `JTLR`, and sends every member their path.
+//! on its books (cash plus receivables, as members compute it with `jitsuin fund`), pays the
+//! queue from the books' cash only (pro rata when cash is short, nothing while the fund is below
+//! par), signs the new unit tree's root into `JTLR`, and sends every member their path with the
+//! books.
+//!
+//! **Assets are the members' money (user decision 2026-10-25).** The node's wallet also holds
+//! the financier's own money, so its balance is not the fund's: a close valued on the wallet
+//! priced period 1 of the production E2E at 5998.2 zat per unit. The fund's books are the
+//! deposits recorded here and their flows, replayed from the chain by
+//! `jitsuin_flow::fund::fund_books`: an advance is the fund's when the books' cash covered it in
+//! full when it was paid, its repayments come back to the books, payouts leave them. Network fees
+//! are paid by the wallet, not the books. Members get the books' txids with their path and read
+//! the values from the chain themselves; the solvency check also asks that the wallet hold at
+//! least the books' cash (it does not show that the cash is set apart from the financier's).
 //!
 //! Paying is money leaving the node, so the close runs only with a passkey approval of that
 //! exact plan (D-43, as `pay::advance`).
@@ -16,7 +27,7 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use jitsuin_core::units::{self, UnitTree};
-use jitsuin_flow::fund::{FundView, ReceivableStatus};
+use jitsuin_flow::fund::{FundBooks, FundView, ReceivableStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -81,6 +92,9 @@ pub struct Close {
     pub payout_txid: Option<String>,
     pub root_txid: String,
     pub held: bool,
+    /// Valued on the fund's books (2026-10-25); false for a close valued on the whole wallet.
+    #[serde(default)]
+    pub books: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +108,11 @@ pub struct Ledger {
     pub deposits: Vec<String>,
     pub queue: Vec<Request>,
     pub closes: Vec<Close>,
+    /// The first period valued on the books (2026-10-25). None in a ledger written before: its
+    /// last close priced the units on the whole wallet, so `nav` is repriced from the books
+    /// (`reprice`) before the next deposit buys at it.
+    #[serde(default)]
+    pub books_since: Option<u32>,
 }
 
 impl Default for Ledger {
@@ -105,6 +124,7 @@ impl Default for Ledger {
             deposits: vec![],
             queue: vec![],
             closes: vec![],
+            books_since: Some(1),
         }
     }
 }
@@ -122,7 +142,11 @@ pub struct Payout {
 pub struct Plan {
     pub period: u32,
     pub nav: Nav,
+    /// The books' cash: what withdrawals are paid from.
     pub cash_zat: u64,
+    /// The whole wallet's balance (shared with the financier's own money); it must cover the
+    /// payouts plus the reserve.
+    pub wallet_zat: u64,
     pub payouts: Vec<Payout>,
     /// Below par: no request is paid this period.
     pub held: bool,
@@ -313,8 +337,48 @@ impl Ledger {
         Ok(u)
     }
 
-    /// The close of the open period, valued at `assets_zat` with `cash_zat` on hand.
-    pub fn plan(&self, assets_zat: u64, cash_zat: u64) -> Plan {
+    /// The fund's own transactions for `jitsuin_flow::fund::fund_books`: every recorded deposit
+    /// and every close's payout.
+    pub fn books(&self) -> FundBooks {
+        FundBooks {
+            deposits: self.deposits.clone(),
+            payouts: self
+                .closes
+                .iter()
+                .filter_map(|c| c.payout_txid.clone())
+                .collect(),
+        }
+    }
+
+    /// A ledger written before the books whose last close priced the units on the wallet.
+    pub fn needs_reprice(&self) -> bool {
+        self.books_since.is_none() && !self.closes.is_empty()
+    }
+
+    /// Moves a ledger written before the books onto them: the open period's price becomes the
+    /// books' assets at the last close (`assets_zat`) over that close's units. Past closes stay
+    /// as they were recorded (`books: false`); their roots are unchanged.
+    pub fn reprice(&mut self, assets_zat: u64) {
+        if self.books_since.is_some() {
+            return;
+        }
+        if let Some(last) = self.closes.last() {
+            self.nav = if last.total_units == 0 || assets_zat == 0 {
+                Nav::PAR
+            } else {
+                Nav {
+                    assets_zat,
+                    units: last.total_units,
+                }
+            };
+        }
+        self.books_since = Some(self.period);
+    }
+
+    /// The close of the open period, valued at `assets_zat` (the books), with `cash_zat` of the
+    /// books' cash and `wallet_zat` in the whole wallet. Payouts stay within the books' cash and
+    /// within what the wallet can pay besides the reserve.
+    pub fn plan(&self, assets_zat: u64, cash_zat: u64, wallet_zat: u64) -> Plan {
         let total = self.total_units();
         let nav = if total == 0 {
             self.nav
@@ -339,7 +403,7 @@ impl Ledger {
                 .collect()
         };
         let want: u64 = payouts.iter().map(|p| p.amount_zat).sum();
-        let budget = cash_zat.saturating_sub(RESERVE_ZAT);
+        let budget = cash_zat.min(wallet_zat.saturating_sub(RESERVE_ZAT));
         let short = want > budget;
         if short {
             for p in &mut payouts {
@@ -352,6 +416,7 @@ impl Ledger {
             period: self.period,
             nav,
             cash_zat,
+            wallet_zat,
             payouts,
             held,
             short,
@@ -429,7 +494,7 @@ impl Ledger {
 }
 
 /// The fund's assets as members value them (`jitsuin fund`): cash, open receivables, overdue
-/// receivables after the haircut.
+/// receivables after the haircut. Give it the books' view (`Books::view`), not the wallet's.
 pub fn assets(view: &FundView) -> u64 {
     let sum = |s: ReceivableStatus| -> u64 {
         view.receivables
@@ -471,12 +536,30 @@ pub fn message(
     message::encode(&h, &[])
 }
 
-/// The `fund.merkle_path` body for one leaf after a close.
+/// The wallet's transactions up to the close's root post (all of them when that post is not
+/// mined or not known): the books as they stood at that close.
+pub fn upto_close(
+    txs: &[jitsuin_wallet::WalletTx],
+    close: &Close,
+) -> Vec<jitsuin_wallet::WalletTx> {
+    let at = txs
+        .iter()
+        .find(|t| t.txid == close.root_txid)
+        .and_then(|t| t.mined_height);
+    txs.iter()
+        .filter(|t| at.is_none_or(|h| t.mined_height.is_some_and(|m| m <= h)))
+        .cloned()
+        .collect()
+}
+
+/// The `fund.merkle_path` body for one leaf after a close, with the fund's books (txids only:
+/// the member reads their values from the chain with the viewing key, `jitsuin fund --path`).
 pub fn path_body(
     tree: &UnitTree,
     leaf: &Leaf,
     period: u32,
     portfolio: Option<&Portfolio>,
+    books: &FundBooks,
 ) -> Option<Value> {
     let id = unhex::<32>(&leaf.id).ok()?;
     let (root, total) = tree.root();
@@ -487,6 +570,7 @@ pub fn path_body(
         "root": hex(&root),
         "total": total,
         "path": hex(&units::path_to_bytes(&tree.path(&id)?)),
+        "books": { "deposits": books.deposits, "payouts": books.payouts },
     });
     if let Some(p) = portfolio {
         b["portfolio"] = serde_json::to_value(p).ok()?;
@@ -565,7 +649,7 @@ mod tests {
         let (mut l, _) = fund(&[1_000_000, 3_000_000]);
         assert_eq!(l.total_units(), 4_000_000);
         // the fund earned 25 %: a close with nothing queued moves the price
-        let plan = l.plan(5_000_000, 5_000_000);
+        let plan = l.plan(5_000_000, 5_000_000, 5_000_000);
         assert!(!plan.held && plan.payouts.is_empty());
         let mut t = 50u8;
         l.apply(&plan, || {
@@ -587,7 +671,7 @@ mod tests {
         assert!(l.withdraw(&[99; 32], None, ADDR, "r", 1).is_err());
         assert!(l.withdraw(&tok[0], Some(2_000_000), ADDR, "r", 1).is_err());
         l.withdraw(&tok[0], Some(400_000), ADDR, "r", 1).unwrap();
-        let plan = l.plan(2_200_000, 2_200_000);
+        let plan = l.plan(2_200_000, 2_200_000, 2_200_000);
         assert_eq!(plan.payouts.len(), 1);
         assert_eq!(plan.payouts[0].amount_zat, 440_000);
         let paid = l.apply(&plan, || [42; 32]).unwrap();
@@ -606,7 +690,7 @@ mod tests {
         l.withdraw(&tok[0], None, ADDR, "a", 1).unwrap();
         l.withdraw(&tok[1], None, ADDR, "b", 1).unwrap();
         // 2.0 M of assets, but only 1.1 M in cash (the rest is lent out)
-        let plan = l.plan(2_000_000, 1_000_000 + RESERVE_ZAT);
+        let plan = l.plan(2_000_000, 1_000_000 + RESERVE_ZAT, 1_000_000 + RESERVE_ZAT);
         assert!(plan.short);
         assert_eq!(plan.payouts[0].units, 500_000);
         assert_eq!(plan.payouts[1].units, 500_000);
@@ -627,7 +711,7 @@ mod tests {
         assert_eq!(l.queue.len(), 2);
         assert!(l.queue.iter().all(|r| r.units == 500_000));
 
-        let below = l.plan(900_000, 900_000);
+        let below = l.plan(900_000, 900_000, 900_000);
         assert!(below.held && below.payouts.is_empty());
     }
 
@@ -635,7 +719,7 @@ mod tests {
     fn a_plan_does_not_apply_to_a_changed_ledger() {
         let (mut l, tok) = fund(&[1_000_000]);
         l.withdraw(&tok[0], None, ADDR, "a", 1).unwrap();
-        let plan = l.plan(1_000_000, 2_000_000);
+        let plan = l.plan(1_000_000, 2_000_000, 2_000_000);
         l.deposit(&[9; 32], 5, "late", &[60; 32]).unwrap();
         assert!(l.apply(&plan, || [61; 32]).is_err());
         let mut changed = plan.clone();
@@ -649,7 +733,7 @@ mod tests {
         let t = l.tree();
         let (root, total) = t.root();
         for leaf in &l.leaves {
-            let b = path_body(&t, leaf, 1, None).unwrap();
+            let b = path_body(&t, leaf, 1, None, &l.books()).unwrap();
             let path = units::path_from_bytes(
                 &(0..b["path"].as_str().unwrap().len() / 2)
                     .map(|i| {
@@ -667,6 +751,134 @@ mod tests {
                 total
             ));
         }
+    }
+
+    fn wallet_tx(txid: &str, height: u32, value: u64) -> jitsuin_wallet::WalletTx {
+        jitsuin_wallet::WalletTx {
+            txid: txid.into(),
+            mined_height: Some(height),
+            fee_zat: Some(10_000),
+            outputs: vec![jitsuin_wallet::TxOutput {
+                index: 0,
+                pool: "Ironwood".into(),
+                value_zat: value,
+                is_change: false,
+                received: true,
+                memo: jitsuin_wallet::Memo::Empty,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_unit_price_comes_from_the_deposits_not_the_whole_wallet() {
+        // E2E 2026-10-25: two member deposits next to 3 ZEC of the financier's own money
+        let mut l = Ledger::default();
+        l.deposit(&[9; 32], 30_000, "d1", &[1; 32]).unwrap();
+        l.deposit(&[9; 32], 20_000, "d2", &[2; 32]).unwrap();
+        let txs = vec![
+            wallet_tx("own", 5, 299_860_000),
+            wallet_tx("d1", 10, 30_000),
+            wallet_tx("d2", 11, 20_000),
+        ];
+        let wallet = 299_910_000;
+        let view = jitsuin_flow::fund::fund_view(&txs, wallet, &[3; 32], 100, 7);
+        let books = jitsuin_flow::fund::fund_books(&view, &txs, &l.books());
+        assert_eq!(books.view.cash_zat, 50_000);
+        let plan = l.plan(assets(&books.view), books.view.cash_zat, wallet);
+        assert_eq!(
+            plan.nav,
+            Nav {
+                assets_zat: 50_000,
+                units: 50_000
+            }
+        );
+        // the wallet-wide price the production close showed (5998.2 zat per unit) is gone
+        assert_ne!(l.plan(assets(&view), view.cash_zat, wallet).nav, plan.nav);
+        l.apply(&plan, || [7; 32]).unwrap();
+        assert_eq!(l.deposit(&[9; 32], 10_000, "d3", &[3; 32]), Ok(10_000));
+    }
+
+    #[test]
+    fn withdrawals_are_paid_from_the_books_cash_only() {
+        let (mut l, tok) = fund(&[1_000_000, 1_000_000]);
+        l.withdraw(&tok[0], None, ADDR, "a", 1).unwrap();
+        // the books hold 2.0 M, half of it lent out; the wallet holds 50 ZEC of other money
+        let plan = l.plan(2_000_000, 600_000, 5_000_000_000);
+        assert!(plan.short);
+        assert!(plan.paid_zat() <= 600_000);
+        assert_eq!(plan.wallet_zat, 5_000_000_000);
+        // and never more than the wallet can pay besides the reserve
+        let tight = l.plan(2_000_000, 2_000_000, 500_000 + RESERVE_ZAT);
+        assert!(tight.short && tight.paid_zat() <= 500_000);
+    }
+
+    #[test]
+    fn a_ledger_closed_on_the_wallet_is_repriced_from_the_books() {
+        // the production ledger after period 1, written before the books
+        let old = json!({
+            "period": 2,
+            "nav": { "assets_zat": 299_910_000u64, "units": 50_000 },
+            "leaves": [],
+            "deposits": ["d1", "d2"],
+            "queue": [],
+            "closes": [{
+                "period": 1, "root": "2ec4", "total_units": 50_000,
+                "nav": { "assets_zat": 299_910_000u64, "units": 50_000 },
+                "paid_zat": 0, "payout_txid": null, "root_txid": "r1", "held": false
+            }],
+        });
+        let mut l: Ledger = serde_json::from_value(old).unwrap();
+        assert!(l.needs_reprice());
+        assert!(!l.closes[0].books);
+        // the books at that close: the two deposits, nothing the fund lent out
+        let txs = vec![
+            wallet_tx("own", 5, 299_860_000),
+            wallet_tx("d1", 10, 30_000),
+            wallet_tx("d2", 11, 20_000),
+            wallet_tx("r1", 20, 10_000),
+            wallet_tx("later", 30, 70_000),
+        ];
+        let at = upto_close(&txs, &l.closes[0]);
+        assert_eq!(at.len(), 4);
+        let view = jitsuin_flow::fund::fund_view(&at, 0, &[3; 32], 100, 7);
+        let books = jitsuin_flow::fund::fund_books(&view, &at, &l.books());
+        l.reprice(assets(&books.view));
+        assert_eq!(
+            l.nav,
+            Nav {
+                assets_zat: 50_000,
+                units: 50_000
+            }
+        );
+        assert_eq!(l.books_since, Some(2));
+        assert!(!l.needs_reprice());
+        // the closed period's record and root stay as they were
+        assert_eq!(l.closes[0].root, "2ec4");
+        l.reprice(1);
+        assert_eq!(l.nav.assets_zat, 50_000);
+        // a new ledger is on the books from the start
+        assert!(!Ledger::default().needs_reprice());
+    }
+
+    #[test]
+    fn a_member_path_carries_the_books() {
+        let (mut l, _) = fund(&[1_000]);
+        l.closes.push(Close {
+            period: 1,
+            root: String::new(),
+            total_units: 1_000,
+            nav: Nav::PAR,
+            paid_zat: 5,
+            payout_txid: Some("p1".into()),
+            root_txid: String::new(),
+            held: false,
+            books: true,
+        });
+        let b = path_body(&l.tree(), &l.leaves[0], 1, None, &l.books()).unwrap();
+        assert_eq!(
+            b["books"],
+            json!({ "deposits": ["tx0"], "payouts": ["p1"] })
+        );
     }
 
     #[test]
