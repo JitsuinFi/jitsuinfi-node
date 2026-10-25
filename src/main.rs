@@ -20,6 +20,7 @@ mod offer;
 mod pay;
 mod provider;
 mod relay;
+mod reminder;
 mod reputation;
 mod setup;
 
@@ -1494,6 +1495,12 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
             break;
         }
     }
+    // buyer-late: D-7, D-1 and D+1 reminders to the buyer while the financed invoice is unpaid
+    if matches!(flow.state(), S::Done { .. }) {
+        if let Err(e) = remind(st, n, &me, &accepted, &flow, &mut meta).await {
+            meta.problem = Some(e);
+        }
+    }
     // HNK-26.T14: another financier registered this invoice first: keep the evidence
     if meta.proof.is_none() {
         match deals::double_proof(&flow, &accepted.buyer_signature) {
@@ -1508,6 +1515,45 @@ async fn drive(st: &State, n: &str) -> Result<Value, String> {
     deals::save_flow(&dir, n, &flow)?;
     let _ = deals::save_meta(&dir, n, &meta);
     Ok(deal_view(&flow, &meta))
+}
+
+/// Sends the buyer the due-date reminder this deal is at, once (`reminder::next`).
+async fn remind(
+    st: &State,
+    n: &str,
+    me: &[u8; 32],
+    accepted: &offer::Accepted,
+    flow: &jitsuin_flow::financier::Flow,
+    meta: &mut deals::Meta,
+) -> Result<(), String> {
+    let inv = &flow.deal().invoice;
+    let Some(milestone) = reminder::next(&reminder::Due {
+        due_date: inv.due_date,
+        today: (unix_now() / 86_400) as u32,
+        sent: &meta.reminders,
+        repayment: meta.repayment.as_deref(),
+        settled: meta.settled_txid.is_some(),
+        buyer_known: accepted.buyer_mailbox_pk.is_some(),
+    }) else {
+        return Ok(());
+    };
+    let to = message::unhex::<32>(accepted.buyer_mailbox_pk.as_deref().unwrap_or_default())?;
+    let bytes = reminder::reminder_message(
+        &st.financier,
+        me,
+        &to,
+        n,
+        milestone,
+        inv.due_date,
+        inv.amount_zat,
+        unix_now(),
+    )?;
+    st.mail
+        .send(&to, &bytes)
+        .await
+        .map_err(|e| format!("the {milestone} reminder did not go out: {e}"))?;
+    meta.reminders.push(milestone.to_string());
+    Ok(())
 }
 
 fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value {
@@ -1530,6 +1576,7 @@ fn deal_view(flow: &jitsuin_flow::financier::Flow, meta: &deals::Meta) -> Value 
     v["history"] = meta.history.clone().into();
     v["problem"] = meta.problem.clone().into();
     v["confirmations"] = meta.entry_confirmations.into();
+    v["reminders"] = json!(meta.reminders);
     v["min_confirmations"] = flow.deal().min_confirmations.into();
     if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
         let i = pay::Intent::of(flow);
