@@ -357,6 +357,12 @@ async fn mail_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
                 };
                 if h["type"] == "deal.offer" {
                     let mut o = offer::summary(&h, &deals);
+                    // E2E audit 2026-10-25: with a buyer-history mandate the opening waits
+                    if !o["accepted"].is_null() {
+                        if let Some(n) = o["n"].as_str() {
+                            o["opening"] = deals::load_meta(&deals, n).opening().into();
+                        }
+                    }
                     if let Some(sent) = h["sent_at"].as_u64() {
                         o["expires_at"] = (sent.min(unix_now()) + OFFER_TTL_SECS).into();
                     }
@@ -658,6 +664,43 @@ async fn wallet_state(st: &State) -> Result<(Vec<jitsuin_wallet::WalletTx>, u64)
     .map_err(|e| format!("the wallet could not sync: {e}"))
 }
 
+/// The fund on its books (user decision 2026-10-25), from the wallet's transactions: the deposits
+/// and payouts of `l`, the advances the books' cash paid and their repayments. `cash` is the
+/// whole wallet's balance; the books' view replaces it for the fund.
+fn fund_books(
+    st: &State,
+    l: &fund::Ledger,
+    txs: &[jitsuin_wallet::WalletTx],
+    cash: u64,
+) -> jitsuin_flow::fund::Books {
+    let manager = st.financier.verifying_key().to_bytes();
+    let view = jitsuin_flow::fund::fund_view(
+        txs,
+        cash,
+        &manager,
+        (unix_now() / 86_400) as u32,
+        GRACE_DAYS,
+    );
+    jitsuin_flow::fund::fund_books(&view, txs, &l.books())
+}
+
+/// A ledger written before the books priced the open period on the whole wallet: reprice it
+/// from the books as they stood at its last close, before a deposit buys at that price.
+fn reprice_legacy(st: &State, l: &mut fund::Ledger, txs: &[jitsuin_wallet::WalletTx]) -> bool {
+    let Some(last) = l.closes.last().filter(|_| l.needs_reprice()) else {
+        return false;
+    };
+    let at = fund::upto_close(txs, last);
+    let books = fund_books(st, l, &at, 0);
+    let assets = fund::assets(&books.view);
+    println!(
+        "fund: period {} repriced from the books: {assets} zat for {} units",
+        l.period, last.total_units
+    );
+    l.reprice(assets);
+    true
+}
+
 async fn send_fund(st: &State, kind: &str, to: &[u8; 32], body: Value) -> Result<(), String> {
     let me = message::unhex::<32>(&st.public.mailbox_pk)?;
     let bytes = fund::message(kind, &st.financier, &me, to, body, unix_now())?;
@@ -685,6 +728,7 @@ async fn fund_get(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
         "deposits": l.deposits.len(),
         "queue": l.queue,
         "closes": l.closes.iter().rev().take(12).collect::<Vec<_>>(),
+        "books_since": l.books_since,
     }))
     .into_response()
 }
@@ -746,6 +790,8 @@ async fn fund_deposit(
         Ok(l) => l,
         Err(e) => return fund_error(e),
     };
+    // a deposit buys at the open period's price, which must come from the books
+    reprice_legacy(&st, &mut l, &txs);
     let mut token = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut token);
     let units = match l.deposit(&member, amount, txid, &token) {
@@ -801,7 +847,7 @@ async fn fund_queue(
     }
 }
 
-/// Values the fund from the wallet and plans the close: the payouts the passkey will approve.
+/// Values the fund on its books and plans the close: the payouts the passkey will approve.
 async fn fund_plan(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
     if let Err((status, msg)) = buyers_writable(&st, &headers) {
         return error(status, msg);
@@ -810,21 +856,19 @@ async fn fund_plan(AxState(st): AxState<State>, headers: HeaderMap) -> Response 
         Ok(w) => w,
         Err(msg) => return error(StatusCode::BAD_GATEWAY, &msg),
     };
-    let manager = st.financier.verifying_key().to_bytes();
-    let view = jitsuin_flow::fund::fund_view(
-        &txs,
-        cash,
-        &manager,
-        (unix_now() / 86_400) as u32,
-        GRACE_DAYS,
-    );
     let _g = st.fund.lock().await;
-    let l = match fund::Ledger::load(&st.data_dir) {
+    let mut l = match fund::Ledger::load(&st.data_dir) {
         Ok(l) => l,
         Err(e) => return fund_error(e),
     };
-    let mut plan = l.plan(fund::assets(&view), view.cash_zat);
-    plan.portfolio = Some(fund::portfolio(&view, (unix_now() / 86_400) as u32));
+    if reprice_legacy(&st, &mut l, &txs) {
+        if let Err(e) = l.save(&st.data_dir) {
+            return fund_error(e);
+        }
+    }
+    let books = fund_books(&st, &l, &txs, cash);
+    let mut plan = l.plan(fund::assets(&books.view), books.view.cash_zat, cash);
+    plan.portfolio = Some(fund::portfolio(&books.view, (unix_now() / 86_400) as u32));
     let id = message::random_id();
     let out = json!({ "plan_id": id, "plan": plan, "paid_zat": plan.paid_zat() });
     st.plans.lock().unwrap().insert(id, plan);
@@ -917,6 +961,7 @@ async fn fund_close(
         payout_txid: payout_txid.clone(),
         root_txid: String::new(),
         held: plan.held,
+        books: true,
     });
     if let Err(e) = l.save(&st.data_dir) {
         return fund_error(e);
@@ -970,10 +1015,11 @@ async fn fund_close(
             undelivered += 1;
         }
     }
+    let books = l.books();
     for leaf in &l.leaves {
         let (Ok(to), Some(body)) = (
             message::unhex::<32>(&leaf.mailbox_pk),
-            fund::path_body(&tree, leaf, plan.period, plan.portfolio.as_ref()),
+            fund::path_body(&tree, leaf, plan.period, plan.portfolio.as_ref(), &books),
         ) else {
             continue;
         };

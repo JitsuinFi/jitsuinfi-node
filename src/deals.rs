@@ -86,6 +86,20 @@ pub struct Meta {
     pub entry_confirmations: Option<u32>,
 }
 
+impl Meta {
+    /// Where the supplier's commitment opening is (E2E audit 2026-10-25), for the console's line
+    /// under an accepted offer: `sent` at accept time, `awaiting_history` while the mandate's
+    /// buyer-history check has not passed (the opening goes out only once it passes), then
+    /// `sent_after_history`.
+    pub fn opening(&self) -> &'static str {
+        match (self.history_requested, &self.history_tag) {
+            (false, _) => "sent",
+            (true, None) => "awaiting_history",
+            (true, Some(_)) => "sent_after_history",
+        }
+    }
+}
+
 /// Confirmations of the entry `txid` in a board lookup at `tip`: 0 while the board does not
 /// show it yet, none when another entry came first (the deal stops then).
 pub fn confirmations(lookup: &jitsuin_board::Lookup, tip: u32, txid: &str) -> Option<u32> {
@@ -532,13 +546,34 @@ pub fn bundle_message(
 
 /// Why a deal stopped, as a code the console turns into a sentence (HNK-32.T3, BL-D23-08,
 /// BL-D27-01), with the txid of the entry that came first on the board.
-fn stop_view(stop: &Stop, v: &mut Value) {
+///
+/// E2E audit 2026-10-25: `stopped_order` says whose entry came first, from the board positions
+/// the stop holds (the winner is the first valid entry, the conflicting ones came later), matched
+/// on this node's financier commitment: `ours_first`, `theirs_first`, or `others_only` when no
+/// entry of this node is among them (the supplier signed it for two other financiers).
+fn stop_view(stop: &Stop, ours: &[u8; 32], v: &mut Value) {
     let (code, winner) = match stop {
         Stop::AlreadyFinanced { winner } => ("AlreadyFinanced", winner),
         Stop::DoubleFinanced { winner, .. } => ("DoubleFinanced", winner),
     };
+    let order = if &winner.entry.financier_commitment == ours {
+        "ours_first"
+    } else {
+        match stop {
+            Stop::DoubleFinanced { conflicting, .. }
+                if conflicting
+                    .iter()
+                    .any(|r| &r.entry.financier_commitment == ours) =>
+            {
+                "theirs_first"
+            }
+            Stop::AlreadyFinanced { .. } => "theirs_first",
+            _ => "others_only",
+        }
+    };
     v["stopped"] = code.into();
     v["stopped_winner"] = winner.txid.clone().into();
+    v["stopped_order"] = order.into();
 }
 
 /// What the console shows of a deal's state.
@@ -562,7 +597,7 @@ pub fn view(flow: &Flow) -> Value {
             v["entry_txid"] = entry.txid.clone().into();
             v["advance_txid"] = advance_txid.clone().into();
         }
-        State::Stopped(stop) => stop_view(stop, &mut v),
+        State::Stopped(stop) => stop_view(stop, &flow.deal().financier_commitment, &mut v),
         _ => {}
     }
     v
@@ -574,6 +609,10 @@ mod tests {
     use jitsuin_core::invoice::sign_invoice;
 
     fn record(txid: &str, height: u32) -> jitsuin_board::BoardRecord {
+        record_for(txid, height, [2; 32])
+    }
+
+    fn record_for(txid: &str, height: u32, commitment: [u8; 32]) -> jitsuin_board::BoardRecord {
         jitsuin_board::BoardRecord {
             txid: txid.into(),
             position: jitsuin_board::Position {
@@ -584,7 +623,7 @@ mod tests {
             entry: BoardEntry {
                 kind: jitsuin_core::EntryKind::Register,
                 nullifier: [1; 32],
-                financier_commitment: [2; 32],
+                financier_commitment: commitment,
                 discount_bucket: 0,
                 tenor_bucket: 0,
                 history_tag: None,
@@ -601,20 +640,62 @@ mod tests {
             &Stop::AlreadyFinanced {
                 winner: winner.clone(),
             },
+            &[9; 32],
             &mut v,
         );
         assert_eq!(
             v,
-            json!({ "stopped": "AlreadyFinanced", "stopped_winner": "ab".repeat(32) })
+            json!({ "stopped": "AlreadyFinanced", "stopped_winner": "ab".repeat(32), "stopped_order": "theirs_first" })
         );
         stop_view(
             &Stop::DoubleFinanced {
                 winner,
                 conflicting: vec![],
             },
+            &[9; 32],
             &mut v,
         );
         assert_eq!(v["stopped"], "DoubleFinanced");
+    }
+
+    #[test]
+    fn a_double_financing_says_whose_entry_came_first() {
+        // E2E 2026-10-25 (TES-INV-DBL-24689): this node's entry was first on the board
+        let (ours, theirs) = ([7u8; 32], [8u8; 32]);
+        let first = |c| record_for(&"a2".repeat(32), 100, c);
+        let later = |c| record_for(&"a4".repeat(32), 101, c);
+        let order = |stop: Stop, mine: &[u8; 32]| {
+            let mut v = json!({});
+            stop_view(&stop, mine, &mut v);
+            v["stopped_order"].as_str().unwrap().to_string()
+        };
+        let ours_first = Stop::DoubleFinanced {
+            winner: first(ours),
+            conflicting: vec![later(theirs)],
+        };
+        assert_eq!(order(ours_first.clone(), &ours), "ours_first");
+        // the same board, seen from the other financier's node
+        assert_eq!(order(ours_first, &theirs), "theirs_first");
+        let others = Stop::DoubleFinanced {
+            winner: first([1; 32]),
+            conflicting: vec![later([3; 32])],
+        };
+        assert_eq!(order(others, &ours), "others_only");
+    }
+
+    #[test]
+    fn the_opening_waits_for_the_buyer_history_when_the_mandate_asks_for_it() {
+        assert_eq!(Meta::default().opening(), "sent");
+        let mut m = Meta {
+            history_requested: true,
+            ..Default::default()
+        };
+        assert_eq!(m.opening(), "awaiting_history");
+        // a failed check leaves a problem but no tag: still waiting, nothing was sent
+        m.problem = Some("certificate 0 is not anchored on the board".into());
+        assert_eq!(m.opening(), "awaiting_history");
+        m.history_tag = Some("ab".repeat(32));
+        assert_eq!(m.opening(), "sent_after_history");
     }
 
     #[test]

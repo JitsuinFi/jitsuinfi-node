@@ -8,11 +8,11 @@ publish = false
 description = "JitsuinFi financier node: wallet, deal state, relay mailbox and console (HNK-26)"
 
 [dependencies]
-# Pinned to a reviewed commit of jitsuinfi-zcash (main after PR #30).
-jitsuin-core = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "46ecae134763410b6aae8152e963bce597a58da1" }
-jitsuin-flow = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "46ecae134763410b6aae8152e963bce597a58da1" }
-jitsuin-board = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "46ecae134763410b6aae8152e963bce597a58da1" }
-jitsuin-wallet = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "46ecae134763410b6aae8152e963bce597a58da1" }
+# Pinned to a reviewed commit of jitsuinfi-zcash (branch hans/e2e-audit-fixes: the fund on its books).
+jitsuin-core = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c" }
+jitsuin-flow = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c" }
+jitsuin-board = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c" }
+jitsuin-wallet = { git = "https://github.com/JitsuinFi/jitsuinfi-zcash", rev = "c2ff6383af4e2d67ea8231b41cdd9d0ac7f6503c" }
 # Same pins as the jitsuinfi-zcash workspace (D-10).
 blake2b_simd = "=1.0.5"
 ed25519-dalek = "2.2"
