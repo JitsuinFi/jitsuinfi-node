@@ -37,8 +37,10 @@ use crate::message::{self, hex, unhex};
 pub const FILE: &str = "fund.json";
 /// Kept back from cash at a close for the fees and the root self-send.
 pub const RESERVE_ZAT: u64 = 100_000;
-/// Share of an overdue receivable written off when valuing the fund, in percent.
-pub const OVERDUE_HAIRCUT_PCT: u64 = 50;
+/// Share of an overdue receivable written off when valuing the fund, in percent. User decision
+/// 2026-10-25: 100 everywhere (as `jitsuin fund --haircut` by default): an overdue, unpaid
+/// receivable counts 0 until its repayment is on chain, and then counts as cash.
+pub const OVERDUE_HAIRCUT_PCT: u64 = 100;
 
 /// The price of units: `assets_zat / units` zatoshi per unit. Par is 1 zat per unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +169,11 @@ pub struct Portfolio {
     pub open: u32,
     pub open_zat: u64,
     pub overdue: u32,
+    /// What the overdue receivables count for in the assets: 0, they are written off in full
+    /// (`OVERDUE_HAIRCUT_PCT`).
     pub overdue_zat: u64,
+    /// What is still unpaid on them (face value less repayments), shown, not counted.
+    pub overdue_face_zat: u64,
     pub repaid: u32,
     /// Open receivables due within 30 days, 31 – 90 days, later.
     pub due_within: [u32; 3],
@@ -180,6 +186,7 @@ pub fn portfolio(view: &FundView, today: u32) -> Portfolio {
         open_zat: 0,
         overdue: 0,
         overdue_zat: 0,
+        overdue_face_zat: 0,
         repaid: 0,
         due_within: [0; 3],
     };
@@ -199,11 +206,12 @@ pub fn portfolio(view: &FundView, today: u32) -> Portfolio {
             }
             ReceivableStatus::Overdue => {
                 p.overdue += 1;
-                p.overdue_zat += r.outstanding_zat();
+                p.overdue_face_zat += r.outstanding_zat();
             }
             ReceivableStatus::Repaid => p.repaid += 1,
         }
     }
+    p.overdue_zat = p.overdue_face_zat * (100 - OVERDUE_HAIRCUT_PCT) / 100;
     p
 }
 
@@ -494,7 +502,8 @@ impl Ledger {
 }
 
 /// The fund's assets as members value them (`jitsuin fund`): cash, open receivables, overdue
-/// receivables after the haircut. Give it the books' view (`Books::view`), not the wallet's.
+/// receivables after the write-off (100 %: they count 0 until repaid). Give it the books' view
+/// (`Books::view`), not the wallet's.
 pub fn assets(view: &FundView) -> u64 {
     let sum = |s: ReceivableStatus| -> u64 {
         view.receivables
@@ -799,6 +808,62 @@ mod tests {
     }
 
     #[test]
+    fn an_overdue_advance_counts_zero_until_its_repayment_is_cash() {
+        use jitsuin_core::{memo, MemoItem, Receipt, ReceiptKind, ReceivableNote};
+        let manager = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let pk = manager.verifying_key().to_bytes();
+        let with_memo = |txid: &str, h: u32, v: u64, received: bool, items: &[MemoItem]| {
+            let mut t = wallet_tx(txid, h, v);
+            t.outputs[0].received = received;
+            t.outputs[0].memo = jitsuin_wallet::Memo::Arbitrary(memo::encode(items).unwrap());
+            t
+        };
+        let advance = vec![
+            MemoItem::Receipt(
+                Receipt::sign(&manager, ReceiptKind::Advance, [5; 32], 80_000, 1).unwrap(),
+            ),
+            MemoItem::Note(ReceivableNote {
+                nullifier: [5; 32],
+                face_zat: 90_000,
+                due_date: 50,
+            }),
+        ];
+        let repay = vec![MemoItem::Receipt(
+            Receipt::sign(&manager, ReceiptKind::Repayment, [5; 32], 90_000, 60).unwrap(),
+        )];
+        let mut l = Ledger::default();
+        l.deposit(&[9; 32], 100_000, "d1", &[1; 32]).unwrap();
+        let mut txs = vec![
+            wallet_tx("d1", 10, 100_000),
+            with_memo("a1", 11, 80_000, false, &advance),
+        ];
+        let value = |txs: &[jitsuin_wallet::WalletTx], today: u32| {
+            let view = jitsuin_flow::fund::fund_view(txs, 1_000_000, &pk, today, 7);
+            let books = jitsuin_flow::fund::fund_books(&view, txs, &l.books());
+            (
+                books.view.cash_zat,
+                assets(&books.view),
+                portfolio(&books.view, today),
+            )
+        };
+        // not due yet: the advance counts at its face value
+        let (cash, a, _) = value(&txs, 40);
+        assert_eq!((cash, a), (20_000, 110_000));
+        // overdue and unpaid: it counts 0, the unpaid face is shown apart
+        let (cash, a, p) = value(&txs, 100);
+        assert_eq!((cash, a), (20_000, 20_000));
+        assert_eq!(
+            (p.overdue, p.overdue_zat, p.overdue_face_zat),
+            (1, 0, 90_000)
+        );
+        // the repayment on chain: back as cash
+        txs.push(with_memo("p1", 12, 90_000, true, &repay));
+        let (cash, a, p) = value(&txs, 100);
+        assert_eq!((cash, a), (110_000, 110_000));
+        assert_eq!((p.overdue, p.repaid), (0, 1));
+    }
+
+    #[test]
     fn withdrawals_are_paid_from_the_books_cash_only() {
         let (mut l, tok) = fund(&[1_000_000, 1_000_000]);
         l.withdraw(&tok[0], None, ADDR, "a", 1).unwrap();
@@ -907,9 +972,11 @@ mod tests {
         };
         let p = portfolio(&view, 100);
         assert_eq!(
-            (p.open, p.open_zat, p.overdue, p.overdue_zat, p.repaid),
+            (p.open, p.open_zat, p.overdue, p.overdue_face_zat, p.repaid),
             (3, 5_500, 1, 4_000, 1)
         );
+        // written off in full: shown as unpaid, counted 0
+        assert_eq!(p.overdue_zat, 0);
         assert_eq!(p.due_within, [1, 1, 1]);
         assert!(!serde_json::to_string(&p).unwrap().contains("0101"));
     }
