@@ -1,6 +1,6 @@
 # jitsuinfi-node
 
-A **JitsuinFi** financier's node (HNK-26): its keys, its Zcash wallet, the board it checks, its relay mailbox, its console and, next, the deal API. Built on the `jitsuin-*` crates of `jitsuinfi-zcash`, pinned to a commit.
+A **JitsuinFi** financier's node (HNK-26): its keys, its Zcash wallet, the board it checks, its relay mailbox, its console and the deal API that console uses ([API](#api-hnk-05t3) below). Built on the `jitsuin-*` crates of `jitsuinfi-zcash`, pinned to a commit.
 
 ## Keys
 All in the data volume (`DATA_DIR`, `/data` on Railway), never in the repo, the image, a log or an API:
@@ -15,6 +15,8 @@ All in the data volume (`DATA_DIR`, `/data` on Railway), never in the repo, the 
 ## Try it: the demo console (HNK-26.T26, D-46)
 
 <https://jitsuinfi-console-demo.vercel.app/console> runs this node with `DEMO=1` on its own testnet service: anyone creates a passkey without an invite and signs in as its financier. Approvals, devices, invites, names and deleting messages are off there, and only the 200 newest passkeys are kept.
+
+Production: deals on <https://jitsuinfi.vercel.app> run against this node; their testnet txids are in the [jitsuinfi-zcash README](https://github.com/JitsuinFi/jitsuinfi-zcash#for-judges-verify-the-testnet-board) (step 6, "Through the live web app and console").
 
 ## Onboarding a financier, no terminal (HNK-26.T20, D-43)
 The node is managed by its provider; the financier only uses a browser and a passkey.
@@ -105,7 +107,7 @@ A deal the terms cannot carry is refused before anything is saved: no advance, a
 - **Anyone:** `/node/info`, `/node/health` and `/node/board` show only public values (financier key, mailbox, wallet address, contact card, the public board). Everything else needs a console session (passkey, the console's `Origin`).
 - **The relay operator:** for each message the mailbox it goes to, its sealed size and the time; never its content, type, sender or N. Timing can still link an offer to the board entry that follows it (no padding or batching yet).
 - **Whoever hosts the node (here Railway, and the provider in the managed model, D-43):** the whole `/data` volume, so `node.key` and the wallet with its age identity. That host can spend the wallet and sign as the financier; the passkey gate only guards the console path. This is why a production financier runs this same image on its own machine.
-- The full table is in the vault, *Threat Model*, "Relay dan node yang sudah dibangun".
+- The protocol's security and privacy considerations are in the `jitsuinfi-zcash` specification ([`docs/zip-shielded-receivable-registry.md`](https://github.com/JitsuinFi/jitsuinfi-zcash/blob/main/docs/zip-shielded-receivable-registry.md), sections *Security considerations* and *Privacy considerations*).
 
 ## License
 
