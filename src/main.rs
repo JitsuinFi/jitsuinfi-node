@@ -23,6 +23,7 @@ mod relay;
 mod reminder;
 mod reputation;
 mod setup;
+mod wallet;
 
 use std::sync::Arc;
 
@@ -132,6 +133,10 @@ struct State {
     board_address: Arc<std::sync::RwLock<Option<String>>>,
     /// One deal step at a time.
     deal_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The wallet as last synced, for the console and the pay preflight.
+    wallet_cache: Arc<std::sync::Mutex<Option<wallet::Snapshot>>>,
+    /// One console wallet sync at a time (`wallet_fresh`).
+    wallet_sync: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl State {
@@ -292,7 +297,13 @@ async fn approve_start(
             None => return error(StatusCode::NOT_FOUND, "make the close plan again"),
         },
         None => match serde_json::from_value::<pay::Intent>(body) {
-            Ok(i) => i.hash(),
+            Ok(i) => {
+                // the wallet must cover it before the passkey is asked
+                if let Some(r) = pay_preflight(&st, i.amount_zat).await {
+                    return r;
+                }
+                i.hash()
+            }
             Err(_) => return error(StatusCode::BAD_REQUEST, "name the payment to approve"),
         },
     };
@@ -653,16 +664,168 @@ fn fund_error(e: impl std::fmt::Display) -> Response {
 
 /// The wallet's transactions and balance, after a sync (zcash-devtool blocks: off the runtime).
 async fn wallet_state(st: &State) -> Result<(Vec<jitsuin_wallet::WalletTx>, u64), String> {
-    let (w, b) = (st.wallet.clone(), st.board.clone());
-    tokio::task::spawn_blocking(move || {
+    wallet_snapshot(st).await.map(|s| (s.txs, s.balance_zat))
+}
+
+/// Syncs the wallet and reads it whole, under the chain lock; the result is kept for the console
+/// (`wallet_cache`). Spendable is the whole balance when the output cannot be split.
+async fn wallet_snapshot(st: &State) -> Result<wallet::Snapshot, String> {
+    let (w, b, bin) = (st.wallet.clone(), st.board.clone(), st.devtool.clone());
+    let s = tokio::task::spawn_blocking(move || {
         let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
-        w.sync()?;
-        w.enhance()?;
-        Ok::<_, jitsuin_wallet::Error>((w.list_tx()?, w.balance_zat()?))
+        w.sync().map_err(|e| e.to_string())?;
+        w.enhance().map_err(|e| e.to_string())?;
+        let txs = w.list_tx().map_err(|e| e.to_string())?;
+        let out = wallet::balance_output(&bin, w.wallet_dir())?;
+        let balance_zat = jitsuin_wallet::parse_balance(&out).map_err(|e| e.to_string())?;
+        let (spendable_zat, pending_zat) = wallet::parse_split(&out).unwrap_or((balance_zat, 0));
+        Ok::<_, String>(wallet::Snapshot {
+            txs,
+            balance_zat,
+            spendable_zat,
+            pending_zat,
+            synced_at: unix_now(),
+        })
     })
     .await
     .expect("wallet task")
-    .map_err(|e| format!("the wallet could not sync: {e}"))
+    .map_err(|e| format!("the wallet could not sync: {e}"))?;
+    *st.wallet_cache.lock().unwrap() = Some(s.clone());
+    Ok(s)
+}
+
+/// The last synced wallet when it is at most `max_age` seconds old.
+fn wallet_cached(st: &State, max_age: u64) -> Option<wallet::Snapshot> {
+    st.wallet_cache
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|s| unix_now().saturating_sub(s.synced_at) <= max_age)
+}
+
+/// The wallet at most `max_age` seconds old, synced now when the last sync is older. One sync at
+/// a time: a caller that waited for another's sync takes its result.
+async fn wallet_fresh(st: &State, max_age: u64) -> Result<wallet::Snapshot, String> {
+    if let Some(s) = wallet_cached(st, max_age) {
+        return Ok(s);
+    }
+    let _g = st.wallet_sync.lock().await;
+    if let Some(s) = wallet_cached(st, max_age) {
+        return Ok(s);
+    }
+    wallet_snapshot(st).await
+}
+
+/// The console's wallet is synced again once it is this old.
+const WALLET_FRESH_SECS: u64 = 15;
+/// How long the console waits for a sync before it gets the last good state.
+const WALLET_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// What the node knows of its own transactions: the deals' entries, advances and `settled`
+/// entries, the fund's deposits and payouts.
+fn wallet_known(st: &State) -> wallet::Known {
+    let mut k = wallet::Known::default();
+    let dir = st.data_dir.join(DEALS_DIR);
+    for n in deals::list(&dir) {
+        if let Some(flow) = deals::load_flow(&dir, &n) {
+            let v = deals::view(&flow);
+            k.add(v["entry_txid"].as_str(), "entry");
+            k.add(v["advance_txid"].as_str(), "advance");
+        }
+        k.add(
+            deals::load_meta(&dir, &n).settled_txid.as_deref(),
+            "settled",
+        );
+    }
+    if let Ok(l) = fund::Ledger::load(&st.data_dir) {
+        for t in &l.deposits {
+            k.add(Some(t), "deposit");
+        }
+        for c in &l.closes {
+            k.add(c.payout_txid.as_deref(), "payout");
+        }
+    }
+    k
+}
+
+/// The node's wallet for its console: balance, spendable, the fund's share, a top-up address and
+/// the latest transactions (`wallet::view`). A sync that takes long answers with the last good
+/// state and an older `synced_at`.
+async fn wallet_get(AxState(st): AxState<State>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = st.signed_in(&headers, false) {
+        return error(status, msg);
+    }
+    let (dir, bin, wdir, b) = (
+        st.data_dir.clone(),
+        st.devtool.clone(),
+        st.wallet.wallet_dir().to_path_buf(),
+        st.board.clone(),
+    );
+    let topup = tokio::task::spawn_blocking(move || {
+        if let Some(a) = wallet::saved_topup(&dir) {
+            return Ok(a);
+        }
+        let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
+        wallet::topup_address(&dir, unix_now(), || deals::new_address(&bin, &wdir))
+    })
+    .await
+    .expect("wallet task");
+    let topup = match topup {
+        Ok(a) => a,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, &e),
+    };
+    let st2 = st.clone();
+    let mut sync = tokio::spawn(async move { wallet_fresh(&st2, WALLET_FRESH_SECS).await });
+    let synced = match tokio::time::timeout(WALLET_WAIT, &mut sync).await {
+        Ok(r) => Some(r.unwrap_or_else(|e| Err(e.to_string()))),
+        Err(_) => None, // still syncing: it finishes in the background
+    };
+    let snap = match synced {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => match wallet_cached(&st, u64::MAX) {
+            Some(s) => s,
+            None => return error(StatusCode::BAD_GATEWAY, &e),
+        },
+        None => match wallet_cached(&st, u64::MAX) {
+            Some(s) => s,
+            // never synced yet: wait for this first sync
+            None => match sync.await.unwrap_or_else(|e| Err(e.to_string())) {
+                Ok(s) => s,
+                Err(e) => return error(StatusCode::BAD_GATEWAY, &e),
+            },
+        },
+    };
+    // the fund's books cash (members' money) when this node runs a fund
+    let fund_cash = if st.data_dir.join(fund::FILE).exists() {
+        match fund::Ledger::load(&st.data_dir) {
+            Ok(l) => Some(
+                fund_books(&st, &l, &snap.txs, snap.balance_zat)
+                    .view
+                    .cash_zat,
+            ),
+            Err(e) => return fund_error(e),
+        }
+    } else {
+        None
+    };
+    Json(wallet::view(&snap, fund_cash, &topup, &wallet_known(&st))).into_response()
+}
+
+/// The pay preflight: a 409 body when the wallet cannot pay `advance` plus the network fee. A recent
+/// state that covers it is enough; a short or old one is synced again before refusing. A wallet
+/// that cannot be read does not refuse: the payment itself reports that.
+async fn pay_preflight(st: &State, advance: u64) -> Option<Response> {
+    if wallet_cached(st, 60).is_some_and(|s| wallet::short(s.spendable_zat, advance).is_none()) {
+        return None;
+    }
+    match wallet_fresh(st, 0).await {
+        Ok(s) => wallet::short(s.spendable_zat, advance)
+            .map(|body| (StatusCode::CONFLICT, Json(body)).into_response()),
+        Err(e) => {
+            eprintln!("pay preflight: {e}");
+            None
+        }
+    }
 }
 
 /// The fund on its books (user decision 2026-10-25), from the wallet's transactions: the deposits
@@ -1617,6 +1780,31 @@ async fn deals_list(AxState(st): AxState<State>, headers: HeaderMap) -> Response
         })
         .collect();
     out.reverse();
+    // deals in Pay: can the wallet pay the advance and its fee? From the last sync (no wait); an
+    // old one is synced again in the background for the next listing.
+    if out.iter().any(|d| d["state"] == "Pay") {
+        let snap = wallet_cached(&st, u64::MAX);
+        if snap
+            .as_ref()
+            .is_none_or(|s| unix_now().saturating_sub(s.synced_at) > WALLET_FRESH_SECS)
+        {
+            let st2 = st.clone();
+            tokio::spawn(async move {
+                if let Err(e) = wallet_fresh(&st2, WALLET_FRESH_SECS).await {
+                    eprintln!("wallet: {e}");
+                }
+            });
+        }
+        for d in out.iter_mut().filter(|d| d["state"] == "Pay") {
+            let advance = d["advance_zat"].as_u64().unwrap_or(0);
+            d["need_zat"] = advance.saturating_add(wallet::FEE_ZAT).into();
+            d["spendable_zat"] = snap.as_ref().map(|s| s.spendable_zat).into();
+            d["wallet_short"] = snap
+                .as_ref()
+                .is_some_and(|s| wallet::short(s.spendable_zat, advance).is_some())
+                .into();
+        }
+    }
     Json(json!({ "deals": out })).into_response()
 }
 
@@ -1652,6 +1840,14 @@ async fn deal_pay(
             "approve the payment with your passkey first",
         );
     };
+    // the wallet must cover the advance and its fee; the approval stays unused when it does not
+    if let Some(flow) = deals::load_flow(&st.data_dir.join(DEALS_DIR), &n) {
+        if matches!(flow.state(), jitsuin_flow::financier::State::Pay { .. }) {
+            if let Some(r) = pay_preflight(&st, flow.deal().advance_zat).await {
+                return r;
+            }
+        }
+    }
     let _g = st.deal_lock.lock().await;
     let dir = st.data_dir.join(DEALS_DIR);
     let Some(mut flow) = deals::load_flow(&dir, &n) else {
@@ -2095,6 +2291,7 @@ fn app(st: State) -> Router {
         .route("/node/console/mandate", get(mandate_get).post(mandate_set))
         .route("/node/console/reputation", post(reputation_request))
         .route("/node/console/fund", get(fund_get))
+        .route("/node/console/wallet", get(wallet_get))
         .route("/node/console/fund/deposits", post(fund_deposit))
         .route(
             "/node/console/fund/deposit-address",
@@ -2283,6 +2480,8 @@ async fn main() {
                         .filter(|a| !a.is_empty()),
                 )),
                 deal_lock: Arc::default(),
+                wallet_cache: Arc::default(),
+                wallet_sync: Arc::default(),
             };
             tokio::spawn(drive_all(st.clone()));
             axum::serve(listener, app(st))
