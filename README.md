@@ -82,15 +82,16 @@ The console (`/console/`) is the only client. "Session" means the console's sign
 | POST | `/node/console/logout` | session | | `ok` |
 | POST | `/node/console/name` | session, write | `name` | `ok` |
 | GET, POST, DELETE | `/node/console/devices`, `/devices/code`, `/devices/{id}` | session (write for POST and DELETE) | | the passkeys; a one-time code to add a device; removal |
-| POST | `/node/console/approve/start`, `/approve/finish` | session, write | `plan`; then `ceremony`, `credential` | the assertion options; then the one-use `approval` token |
+| POST | `/node/console/approve/start`, `/approve/finish` | session, write | `plan`, or the advance's `n`, `amount_zat`, `address`; then `ceremony`, `credential` | the assertion options; then the one-use `approval` token. An advance the wallet cannot pay with the fee is refused first: `409 {error, need_zat, spendable_zat, advance_zat, fee_zat}` |
 | GET | `/node/mail` | session | | `messages` (offers, seals, history, fund mail), `refused`; an accepted offer says where the commitment opening is (`opening`: `sent`, `awaiting_history`, `sent_after_history`) |
 | DELETE | `/node/mail/{id}` | session, write | | `ok` |
 | GET | `/node/mail/{id}/attachments/{index}` | session | | the attachment's bytes (the invoice PDF) |
 | POST | `/node/console/offers/{id}/accept` | session, write | `advance_zat`, `min_confirmations` | the new deal; asks the buyer's history first when the private mandate says so |
 | POST | `/node/console/offers/{id}/decline` | session, write | `reason` | `ok`; the supplier gets `deal.decline` |
-| GET | `/node/console/deals` | session | | `deals`: state, txids, seals, the next step per deal; a stopped deal's `stopped`, `stopped_winner` and `stopped_order` (`ours_first`, `theirs_first`, `others_only`) |
+| GET | `/node/console/deals` | session | | `deals`: state, txids, seals, the next step per deal; a stopped deal's `stopped`, `stopped_winner` and `stopped_order` (`ours_first`, `theirs_first`, `others_only`); a deal in Pay also `need_zat` (advance plus fee), `spendable_zat` (last sync, `null` before one) and `wallet_short` |
 | POST | `/node/console/deals/{n}/step` | session, write | | the deal after one step of `jitsuin-flow` |
-| POST | `/node/console/deals/{n}/pay` | session, write, approval | `approval` | the advance txid |
+| POST | `/node/console/deals/{n}/pay` | session, write, approval | `approval` | the advance txid; `409` as for `approve/start` when the wallet is short (the approval stays unused) |
+| GET | `/node/console/wallet` | session | | the node's wallet: `balance_zat`, `spendable_zat`, `pending_zat`, `fund_cash_zat` and `own_zat` (`null` without a fund), `fee_zat`, `topup_address` and `topup_uri` (one shielded address made once, `wallet-topup.json`), `txs` (newest 30: `txid`, `height`, `delta_zat`, `kind`), `synced_at`; synced at most every 15 s, the last good state when a sync takes over 8 s |
 | GET, POST | `/node/console/mandate`, `/mandate/private` | session (write for POST) | the mandate | the published and the private mandate |
 | GET, POST, DELETE | `/node/console/buyers`, `/buyers/{pk}` | session (write for POST and DELETE) | `identity_pk`, `label` | the KYC list of buyer identity keys |
 | POST | `/node/console/reputation` | session, write | | `deals`: the signed settlement history for the directory |
