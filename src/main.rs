@@ -675,8 +675,10 @@ async fn wallet_snapshot(st: &State) -> Result<wallet::Snapshot, String> {
         let _g = b.chain.lock().unwrap_or_else(|p| p.into_inner());
         w.sync().map_err(|e| e.to_string())?;
         w.enhance().map_err(|e| e.to_string())?;
-        let txs = w.list_tx().map_err(|e| e.to_string())?;
-        let out = wallet::balance_output(&bin, w.wallet_dir())?;
+        let list = wallet::devtool_output(&bin, w.wallet_dir(), "list-tx")?;
+        let txs = jitsuin_wallet::parse_list_tx(&list).map_err(|e| e.to_string())?;
+        let deltas = wallet::deltas(&list);
+        let out = wallet::devtool_output(&bin, w.wallet_dir(), "balance")?;
         let balance_zat = jitsuin_wallet::parse_balance(&out).map_err(|e| e.to_string())?;
         let (spendable_zat, pending_zat) = wallet::parse_split(&out).unwrap_or((balance_zat, 0));
         Ok::<_, String>(wallet::Snapshot {
@@ -684,6 +686,7 @@ async fn wallet_snapshot(st: &State) -> Result<wallet::Snapshot, String> {
             balance_zat,
             spendable_zat,
             pending_zat,
+            deltas,
             synced_at: unix_now(),
         })
     })
