@@ -1,6 +1,91 @@
-# jitsuinfi-node
+<p align="center">
+  <a href="https://jitsuinfi.vercel.app"><img src=".github/readme/banner.svg" alt="JitsuinFi: Zcash stops double-spending. JitsuinFi stops double-financing." width="100%"></a>
+</p>
+
+<p align="center">
+  <img alt="Zcash testnet, Ironwood pool" src="https://img.shields.io/badge/Zcash-testnet%20%C2%B7%20Ironwood%20pool-032C7D?style=flat-square">
+  <img alt="ZECATHON 2026, Private Markets" src="https://img.shields.io/badge/ZECATHON%202026-Private%20Markets-7E2A53?style=flat-square">
+  <img alt="License MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-461D3A?style=flat-square">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-node-461D3A?style=flat-square&logo=rust&logoColor=white">
+  <img alt="Console demo" src="https://img.shields.io/badge/console-demo%20live-1D97F1?style=flat-square">
+</p>
+
+<p align="center">
+  <b>A financier's node: its keys, its Zcash wallet, the board it checks, its sealed mailbox, its console and the deal API.</b>
+</p>
+
+<p align="center">
+  <a href="https://jitsuinfi.vercel.app"><b>Landing</b></a> ·
+  <a href="https://jitsuinfi.vercel.app/app"><b>App</b></a> ·
+  <a href="https://jitsuinfi.vercel.app/try"><b>Try to double-finance</b></a> ·
+  <a href="https://jitsuinfi.vercel.app/verify"><b>Verify</b></a> ·
+  <a href="https://jitsuinfi-console-demo.vercel.app/console"><b>Console demo</b></a> ·
+  <a href="https://youtu.be/RB9hKSLarJo"><b>2-min video</b></a>
+</p>
+
+<p align="center">
+  <a href="https://youtu.be/RB9hKSLarJo"><img src=".github/readme/video-thumb.jpg" alt="Watch the 2-minute demo on YouTube" width="760"></a>
+  <br><sub>Two minutes: the idea, a double-financing attempt caught live on the testnet board, and a whole deal from supplier to settlement.</sub>
+</p>
 
 A **JitsuinFi** financier's node (HNK-26): its keys, its Zcash wallet, the board it checks, its relay mailbox, its console and the deal API that console uses ([API](#api-hnk-05t3) below). Built on the `jitsuin-*` crates of `jitsuinfi-zcash`, pinned to a commit.
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src=".github/readme/console.webp" alt="The console: sealed offer to advance" width="100%"><br><b>The console: sealed offer to advance</b><br><sub>An offer reaches the Desk in about 6 s; the financing letter carries the supplier's 売 and buyer's 買 seals; one passkey touch approves the advance.</sub></td>
+    <td width="50%" valign="top"><img src=".github/readme/wallet.webp" alt="Wallet: who pays what" width="100%"><br><b>Wallet: who pays what</b><br><sub>The node's wallet pays the advance and the network fees (about 0.0001 ZEC each). JitsuinFi never holds anyone's money.</sub></td>
+  </tr>
+</table>
+
+## Inside the node
+
+```mermaid
+flowchart LR
+    C([Financier<br/>console, passkey]):::human
+    subgraph Node [jitsuin-node, one per financier]
+      K[node.key<br/>financier key + mailbox key]:::seal
+      W[(Zcash wallet<br/>pays advances and fees)]:::zcash
+      BW[(board-watch<br/>watch-only, public UFVK)]:::zcash
+      FL[jitsuin-flow<br/>deal state machine]:::sys
+      API[deal API<br/>/node/console/*]:::sys
+    end
+    R[Relay<br/>sealed mailbox]:::sys
+    Z[(Zcash testnet<br/>public board)]:::zcash
+    C -- WebAuthn session, approvals --> API
+    API --> FL
+    FL --> W
+    FL --> BW
+    K --> FL
+    R <-- offers, seals, letters --> API
+    W -- public record, advance, settled --> Z
+    BW -- scan --> Z
+    classDef human fill:#FCFCFE,stroke:#7E2A53,color:#461D3A,stroke-width:2px
+    classDef zcash fill:#020D2F,stroke:#1D97F1,color:#C4C7F2,stroke-width:2px
+    classDef sys fill:#F6F5FC,stroke:#032C7D,color:#020D2F,stroke-width:2px
+    classDef seal fill:#7E2A53,stroke:#461D3A,color:#FCFCFE,stroke-width:2px
+```
+
+**The deal state machine** (`jitsuin_flow::financier::Flow`): money moves only in `Register` (the public record and its fee) and `Pay` (the advance with the financier's seal, in one shielded transaction).
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Check: offer accepted
+    Check --> AwaitSupplierSignature: N not on the board
+    Check --> Stopped: N already there (AlreadyFinanced)
+    AwaitSupplierSignature --> Register: supplier signed the public record
+    Register --> AwaitConfirmation: public record posted
+    Register --> Stopped: conflict found (DoubleFinanced)
+    AwaitConfirmation --> AwaitAssignment: enough confirmations
+    AwaitAssignment --> Pay: financing letter sealed by supplier and buyer
+    Pay --> AwaitAdvanceConfirmation: advance + financier seal sent (passkey)
+    AwaitAdvanceConfirmation --> Done: advance mined
+    AwaitAdvanceConfirmation --> Pay: expired, paid again once
+    Done --> [*]
+    Stopped --> [*]
+```
+
+<p align="center"><img src=".github/readme/route.svg" alt="The deal route: 照 sent to the buyer, 署 buyer signs, 登 public record, 印 financing letter sealed, 金 advance, 済 settled" width="100%"></p>
 
 ## Keys
 All in the data volume (`DATA_DIR`, `/data` on Railway), never in the repo, the image, a log or an API:
@@ -27,6 +112,10 @@ The node is managed by its provider; the financier only uses a browser and a pas
 The setup code pairs the first passkey only; once a passkey is paired it is refused, and five wrong tries lock it for 15 minutes. More devices: **Add a device** in a signed-in console gives a one-time invite link (15 minutes). `jitsuin-node pair` (Railway: `railway ssh --service financier-node jitsuin-node pair`) stays for the provider's recovery only.
 
 ## New financiers: apply, review, node (HNK-26.T25, D-46)
+
+<details>
+<summary>The provider's steps</summary>
+
 A financier applies at `jitsuinfi.vercel.app/apply`. The application (name, contact, note) is sealed to the provider's mailbox; the relay keeps ciphertext only. The provider, on its own machine:
 1. `jitsuin-node provider init` once: makes the provider key in `~/.jitsuin-provider` (0600; back it up) and prints the public mailbox and signing keys the web app carries (`src/lib/provider.ts`).
 2. `jitsuin-node provider inbox`: reads the applications. Review is manual (financier KYC is a later task, HNK-26.T27).
@@ -35,7 +124,13 @@ A financier applies at `jitsuinfi.vercel.app/apply`. The application (name, cont
 
 The applicant checks for the invite on the same page, in the same browser; the page opens only a link signed by the provider key that points to a JitsuinFi console.
 
+</details>
+
 ## Console pairing and sign-in (HNK-26.T2, T3)
+
+<details>
+<summary>How pairing and sign-in work</summary>
+
 1. Set `NODE_ORIGIN` to the node's own HTTPS origin (the Railway domain); its host is the passkey `rp.id`.
 2. On the node, run `jitsuin-node pair` (Railway: `railway ssh --service financier-node jitsuin-node pair`). It prints a one-time code, valid for 15 minutes; only its hash is stored, never a log line.
 3. Open `<NODE_ORIGIN>/console/pair`, type the code and create the passkey. The node verifies the attestation (challenge, origin, `rpIdHash`, user verification) and keeps the credential.
@@ -48,7 +143,13 @@ Every advance needs a passkey approval of that payment (HNK-26.T15): `POST /node
 
 A code is used up on its first correct try and dropped after five wrong ones. The console's POSTs must carry the console's own `Origin`; every response has a same-origin CSP and `frame-ancestors 'none'`.
 
+</details>
+
 ## Settings
+
+<details>
+<summary>Open the reference</summary>
+
 | Variable | Value |
 |---|---|
 | `BOARD_UFVK` | the public board key (`jitsuinfi-zcash/examples/testnet/board-ufvk.txt`) |
@@ -63,12 +164,23 @@ A code is used up on its first correct try and dropped after five wrong ones. Th
 | `DEMO` | `1` for the judges' demo console: pairing without an invite, payments, approvals, device removal, invites, name changes and message removal off; each visitor sees only its own passkey; the newest 200 passkeys are kept |
 | `PORT` | set by Railway |
 
+</details>
+
 ## Deploy
+
+<details>
+<summary>Open the reference</summary>
+
 CI builds `jitsuin-node` and zcash-devtool on ubuntu-24.04 (zcash-devtool cached by revision) and runs `railway up deploy --service financier-node`: `deploy/Dockerfile` only copies the two binaries, so Railway never compiles. Secrets: `ZCASH_DEPLOY_KEY` (read-only deploy key of `jitsuinfi-zcash`), `RAILWAY_TOKEN` (project token of `jitsuinfi-relay`). The service mounts a Railway Volume at `/data`.
 
 Status: in development for ZECATHON 2026, on Zcash testnet. The spending key is a hot wallet on the server: fine for small testnet amounts; a production financier runs its node on its own infrastructure.
 
+</details>
+
 ## API (HNK-05.T3)
+
+<details>
+<summary>Open the reference</summary>
 
 The console (`/console/`) is the only client. "Session" means the console's signed-in cookie from a passkey sign-in; "write" routes also need the request's `Origin` to be `NODE_ORIGIN`. "Approval" means a fresh passkey assertion over the plan the console shows (`approve/start`, then `approve/finish`), so a stolen session cannot move funds. Errors are `{ "error": "<sentence for the financier>" }` with a 4xx or 5xx status.
 
@@ -104,11 +216,15 @@ The fund is valued on its books, not on the node's whole wallet (user decision 2
 
 A deal the terms cannot carry is refused before anything is saved: no advance, an advance above what the supplier asked, confirmations outside 1 to 100 (`offer::accept`), and `jitsuin_flow::Flow::new` checks again (advance, confirmations, supplier address, classes, a letter that belongs to this invoice).
 
+</details>
+
 ## Who can see what (HNK-30.T10)
 - **Anyone:** `/node/info`, `/node/health` and `/node/board` show only public values (financier key, mailbox, wallet address, contact card, the public board). Everything else needs a console session (passkey, the console's `Origin`).
 - **The relay operator:** for each message the mailbox it goes to, its sealed size and the time; never its content, type, sender or N. Timing can still link an offer to the board entry that follows it (no padding or batching yet).
 - **Whoever hosts the node (here Railway, and the provider in the managed model, D-43):** the whole `/data` volume, so `node.key` and the wallet with its age identity. That host can spend the wallet and sign as the financier; the passkey gate only guards the console path. This is why a production financier runs this same image on its own machine.
 - The protocol's security and privacy considerations are in the `jitsuinfi-zcash` specification ([`docs/zip-shielded-receivable-registry.md`](https://github.com/JitsuinFi/jitsuinfi-zcash/blob/main/docs/zip-shielded-receivable-registry.md), sections *Security considerations* and *Privacy considerations*).
+
+<p align="center"><img src=".github/readme/outro.webp" alt="Zcash stops double-spending. JitsuinFi stops double-financing." width="640"></p>
 
 ## License
 

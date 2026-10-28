@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" width="1200" height="400" role="img" aria-label="JitsuinFi: Zcash stops double-spending. JitsuinFi stops double-financing.">
+  <style>
+    .serif{font-family:"Shippori Mincho B1","Hiragino Mincho ProN","Yu Mincho","Noto Serif JP",Georgia,"Times New Roman",serif}
+    .sans{font-family:Geist,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+    .mono{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    @keyframes drop{0%,8%{transform:translateY(-230px)}22%{transform:translateY(0)}24%{transform:translateY(0) scale(1.04,.92)}30%,64%{transform:translateY(0)}78%,100%{transform:translateY(-230px)}}
+    @keyframes ink{0%,22%{opacity:0;transform:scale(.7)}30%,88%{opacity:.92;transform:scale(1)}96%,100%{opacity:0;transform:scale(1)}}
+    @keyframes ring{0%,22%{opacity:0;r:40}24%{opacity:.7;r:60}48%,100%{opacity:0;r:170}}
+    @keyframes rise{0%,32%{opacity:0;transform:translateY(16px)}42%,88%{opacity:1;transform:translateY(0)}96%,100%{opacity:0}}
+    @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+    @keyframes fade{0%{opacity:0;transform:translateY(10px)}100%{opacity:1;transform:translateY(0)}}
+    .seal{animation:drop 6s cubic-bezier(.2,.9,.2,1) infinite;transform-origin:930px 250px}
+    .imp{animation:ink 6s linear infinite;transform-origin:930px 250px}
+    .ring{animation:ring 6s ease-out infinite}
+    .n{animation:rise 6s ease-out infinite}
+        .cur{animation:blink 1s steps(1) infinite}
+  </style>
+  <rect width="1200" height="400" fill="#F6F5FC"/>
+  <g stroke="#ECD0EC" stroke-width="1">
+    <path d="M0 80H1200M0 160H1200M0 240H1200M0 320H1200"/>
+  </g>
+  <rect x="690" y="0" width="510" height="400" fill="#020D2F"/>
+  <g stroke="#032C7D" stroke-width="1"><path d="M690 100H1200M690 200H1200M690 300H1200"/></g>
+  <circle class="ring" cx="930" cy="250" r="40" fill="none" stroke="#1D97F1" stroke-width="2" opacity="0"/>
+  <g class="imp">
+    <circle cx="930" cy="250" r="62" fill="none" stroke="#7E2A53" stroke-width="7"/>
+    <circle cx="930" cy="250" r="51" fill="none" stroke="#7E2A53" stroke-width="2"/>
+    <text x="930" y="244" text-anchor="middle" class="serif" font-size="40" font-weight="800" fill="#7E2A53">実</text>
+    <text x="930" y="286" text-anchor="middle" class="serif" font-size="40" font-weight="800" fill="#7E2A53">印</text>
+  </g>
+  <g class="seal">
+    <rect x="896" y="88" width="68" height="150" rx="10" fill="#7E2A53"/>
+    <rect x="896" y="88" width="20" height="150" rx="8" fill="#6B2347"/>
+    <circle cx="930" cy="80" r="26" fill="#461D3A"/>
+    <rect x="892" y="234" width="76" height="10" rx="3" fill="#461D3A"/>
+  </g>
+  <g class="n mono" font-size="15" fill="#C4C7F2">
+    <text x="726" y="52">N = H(invoice)</text>
+    <text x="726" y="362">f9755d220e9d52da8b392467aeb63c6f…25cd5</text>
+    <text x="1080" y="52" fill="#1D97F1">● testnet</text>
+  </g>
+  <g class="t1">
+    <text x="64" y="120" class="serif" font-size="84" font-weight="800" fill="#020D2F">Jitsuin<tspan fill="#7E2A53">Fi</tspan></text>
+  </g>
+  <g class="t2 serif" font-size="30" font-weight="700">
+    <text x="66" y="196" fill="#020D2F">Zcash stops double-spending.</text>
+    <text x="66" y="240" fill="#7E2A53">JitsuinFi stops double-financing.</text>
+  </g>
+  <g class="t3 sans" font-size="18" fill="#502A50">
+    <text x="66" y="300">Private invoice financing on Zcash: the buyer seals, only a</text>
+    <text x="66" y="326">fingerprint goes on a public board, a second financing is caught.</text>
+    <rect class="cur" x="634" y="312" width="10" height="18" fill="#7E2A53"/>
+  </g>
+</svg>
