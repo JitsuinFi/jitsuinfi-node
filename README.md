@@ -87,6 +87,89 @@ stateDiagram-v2
 
 <p align="center"><img src=".github/readme/route.svg" alt="The deal route: 照 sent to the buyer, 署 buyer signs, 登 public record, 印 financing letter sealed, 金 advance, 済 settled" width="100%"></p>
 
+## Flow in this repo (node)
+
+**Sequence: one deal through the node** (`src/deals.rs`, `src/pay.rs`, `jitsuin_flow::financier::Flow`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Financier (console)
+    participant N as Node API
+    participant M as Mailbox (relay)
+    participant F as Flow (deals/N.flow)
+    participant W as Wallet
+    participant Z as Board (Zcash testnet)
+    M->>N: sealed offer (polled)
+    N->>N: check signatures, published + private mandate
+    C->>N: Accept (advance, confirmations)
+    N->>Z: lookup N on the latest board scan
+    N->>F: Flow::new, state Check → AwaitSupplierSignature
+    N->>M: deal.commitment_opening to the supplier
+    M->>N: deal.entry (supplier signed the public record)
+    F->>W: Register: post the entry (10 000 zat memo + fee)
+    W->>Z: public record
+    Z-->>N: mined, confirmed, still the first valid entry
+    N->>M: deal.letter + PDF to supplier and buyer
+    M->>N: deal.seal from supplier, then buyer
+    C->>N: Pay the advance (passkey approval of this exact plan)
+    N->>N: pay preflight: wallet holds advance + fee?
+    F->>W: advance + financier seal, one shielded tx
+    W->>Z: advance
+    N->>M: deal.advance (txid) to the supplier
+    Z-->>N: buyer's repayment found (ZIP-321 receipt)
+    W->>Z: settled entry
+```
+
+**DFD: what the node keeps**
+
+```mermaid
+flowchart LR
+    FIN[Financier<br/>console, passkey]:::human
+    PRV[Provider<br/>setup, invites]:::human
+    RL[Relay<br/>mailboxes]:::sys
+    ZC[Zcash testnet<br/>lightwalletd]:::zcash
+    MEM[Fund members]:::human
+    P1((1.0<br/>Setup, pair,<br/>sign in)):::seal
+    P2((2.0<br/>Read mailbox,<br/>match mandate)):::sys
+    P3((3.0<br/>Run deal flow)):::sys
+    P4((4.0<br/>Approve and pay)):::seal
+    P5((5.0<br/>Scan board)):::zcash
+    P6((6.0<br/>Fund books,<br/>wallet view)):::sys
+    D1[(node.key, wallet.age)]:::store
+    D2[(console-credentials,<br/>pairing)]:::store
+    D3[(deals/N.flow)]:::store
+    D4[(mandate, private-mandate,<br/>buyers, directory)]:::store
+    D5[(wallet/, board-watch/)]:::store
+    D6[(fund.json)]:::store
+    PRV -- SETUP_CODE --> P1
+    FIN -- passkey assertion --> P1
+    P1 <--> D2
+    RL -- sealed offers, seals --> P2
+    D4 -- rules --> P2
+    D1 -- mailbox key --> P2
+    P2 -- accepted offer --> P3
+    FIN -- accept, decline --> P2
+    P3 <--> D3
+    P3 -- letters, advance notice --> RL
+    FIN -- approval token --> P4
+    D3 -- pay plan --> P4
+    P4 -- signed tx --> D5
+    D5 -- public record, advance, settled --> ZC
+    ZC -- blocks --> P5
+    P5 -- board, repayments --> P3
+    P5 <--> D5
+    MEM -- deposits --> P6
+    P6 <--> D6
+    P6 -- balance, transactions --> FIN
+    classDef human fill:#FCFCFE,stroke:#7E2A53,color:#461D3A,stroke-width:2px
+    classDef zcash fill:#020D2F,stroke:#1D97F1,color:#C4C7F2,stroke-width:2px
+    classDef sys fill:#F6F5FC,stroke:#032C7D,color:#020D2F,stroke-width:2px
+    classDef seal fill:#7E2A53,stroke:#461D3A,color:#FCFCFE,stroke-width:2px
+    classDef store fill:#ECD0EC,stroke:#7E2A53,color:#461D3A,stroke-width:1px
+```
+<sub>DFD legend: rectangles are external entities, circles are processes, cylinders are data stores; arrows carry the named data.</sub>
+
 ## Keys
 All in the data volume (`DATA_DIR`, `/data` on Railway), never in the repo, the image, a log or an API:
 - `node.key` (32 random bytes, mode 0600): the financier's Ed25519 key and its mailbox key are derived from it (BLAKE2b, personalizations `JitsuinNodeFin__`, `JitsuinNodeMbox_`).
