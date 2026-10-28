@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::message::{self, hex, unhex, Message};
 
+#[derive(Clone)]
 pub struct Relay {
     base: String,
     http: reqwest::Client,
@@ -49,9 +50,9 @@ struct Challenge {
 }
 
 #[derive(Deserialize)]
-struct Listed {
-    id: String,
-    received_at: String,
+pub struct Listed {
+    pub id: String,
+    pub received_at: String,
 }
 
 impl Relay {
@@ -172,49 +173,53 @@ impl Relay {
     /// the number of messages refused (do not open, malformed, or addressed elsewhere).
     pub async fn receive(&self, me: &MailboxKeys) -> Result<(Vec<Received>, usize, String)> {
         let token = self.read_token(me).await?;
-        let id = hex(&me.id());
-        let list: Vec<Listed> = serde_json::from_value(
+        let list = self.list(me, &token).await?;
+        let mut out = Vec::new();
+        let mut refused = 0;
+        for m in list {
+            let sealed = self.fetch(&hex(&me.id()), &token, &m.id).await?;
+            match open(me, m, &sealed) {
+                Some(r) => out.push(r),
+                None => refused += 1,
+            }
+        }
+        Ok((out, refused, token))
+    }
+
+    /// The mailbox's listing (ids and arrival times), with a read token.
+    pub async fn list(&self, me: &MailboxKeys, token: &str) -> Result<Vec<Listed>> {
+        serde_json::from_value(
             self.json(
                 self.http
-                    .get(format!("{}/api/mailbox/{id}/messages", self.base))
-                    .bearer_auth(&token),
+                    .get(format!(
+                        "{}/api/mailbox/{}/messages",
+                        self.base,
+                        hex(&me.id())
+                    ))
+                    .bearer_auth(token),
             )
             .await?["messages"]
                 .take(),
         )
-        .map_err(err)?;
-        let mut out = Vec::new();
-        let mut refused = 0;
-        for m in list {
-            let sealed = self
-                .call(
-                    self.http
-                        .get(format!("{}/api/mailbox/{id}/messages/{}", self.base, m.id))
-                        .bearer_auth(&token),
-                )
-                .await?
-                .bytes()
-                .await
-                .map_err(err)?;
-            match me
-                .open(&sealed)
-                .map_err(err)
-                .and_then(|p| message::decode(&p, &id).map_err(RelayError))
-            {
-                Ok(message) => {
-                    let signature_ok = message.header.get("sig").is_none()
-                        || message::verify(&message.header, None);
-                    out.push(Received {
-                        relay_id: m.id,
-                        received_at: m.received_at,
-                        message,
-                        signature_ok,
-                    });
-                }
-                Err(_) => refused += 1,
-            }
-        }
-        Ok((out, refused, token))
+        .map_err(err)
+    }
+
+    /// One sealed message, as stored at the relay.
+    pub async fn fetch(&self, mailbox_id: &str, token: &str, relay_id: &str) -> Result<Vec<u8>> {
+        Ok(self
+            .call(
+                self.http
+                    .get(format!(
+                        "{}/api/mailbox/{mailbox_id}/messages/{relay_id}",
+                        self.base
+                    ))
+                    .bearer_auth(token),
+            )
+            .await?
+            .bytes()
+            .await
+            .map_err(err)?
+            .to_vec())
     }
 
     /// Removes a message after it was used.
@@ -231,6 +236,23 @@ impl Relay {
         .await?;
         Ok(())
     }
+}
+
+/// Opens and checks one sealed message; `None` when it is refused (does not open, malformed, or
+/// addressed elsewhere).
+pub fn open(me: &MailboxKeys, m: Listed, sealed: &[u8]) -> Option<Received> {
+    let message = me
+        .open(sealed)
+        .ok()
+        .and_then(|p| message::decode(&p, &hex(&me.id())).ok())?;
+    let signature_ok =
+        message.header.get("sig").is_none() || message::verify(&message.header, None);
+    Some(Received {
+        relay_id: m.id,
+        received_at: m.received_at,
+        message,
+        signature_ok,
+    })
 }
 
 /// The financier's contact card, the same format as the web app's `src/lib/contact.ts`:
